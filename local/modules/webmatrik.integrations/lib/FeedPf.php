@@ -1352,6 +1352,48 @@ class FeedPf extends Feed
         }
     }
 
+    public function getListingId($reference)
+    {
+        // First search live listings
+        $httpClient = self::getHttpClient();
+        $url = "https://atlas.propertyfinder.com/v1/listings";
+        $query = http_build_query([
+            'filter' => [
+                'reference' => $reference
+            ]
+        ]);
+        $response = $httpClient->get($url . '?' . $query);
+        $status = $httpClient->getStatus();
+        if ($status === 200) {
+            $json = json_decode($response, true);
+            if (!empty($json['results'][0]['id'])) {
+                echo "Found live: {$json['results'][0]['id']}\n";
+                return $json['results'][0]['id'];
+            }
+        }
+
+        // Then search draft listings
+        $url = "https://atlas.propertyfinder.com/v1/listings";
+        $query = http_build_query([
+            'draft' => true,
+            'filter' => [
+                'reference' => $reference
+            ]
+        ]);
+        $response = $httpClient->get($url . '?' . $query);
+        $status = $httpClient->getStatus();
+        if ($status === 200) {
+            $json = json_decode($response, true);
+            if (!empty($json['results'][0]['id'])) {
+                echo "Found draft: {$json['results'][0]['id']}\n";
+                return $json['results'][0]['id'];
+            }
+        }
+
+        echo "Not found for reference: $reference\n";
+        return null;
+    }
+
     /*public function setLocations()
     {
         //$token = self::makeAuth();
