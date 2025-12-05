@@ -1036,6 +1036,15 @@ class FeedBayut extends Feed
             $property->Bedrooms = $item['Bedrooms'];
             $property->Bathroom = $item['Bathrooms'];
             $property->Price = $item['Price'];
+
+            // Before writing into XML
+            if (isset($item['assignedTo']['User_ID']) && (int)$item['assignedTo']['User_ID'] === 11909) {
+                // Custom override for user 11909
+                $item['assignedTo']['Listing_Agent'] = "Joach Ann Jabagat";
+                $item['assignedTo']['Listing_Agent_Email'] = "admin@primocapital.ae";
+                $item['assignedTo']['Listing_Agent_Phone'] = "97145427114";
+            }
+
             $property->Listing_Agent = $item['assignedTo']['Listing_Agent'];
             $property->Listing_Agent_Phone = $item['assignedTo']['Listing_Agent_Phone'];
             $property->Listing_Agent_Email = $item['assignedTo']['Listing_Agent_Email'];

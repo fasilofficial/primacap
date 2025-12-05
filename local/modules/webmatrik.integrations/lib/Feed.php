@@ -251,6 +251,7 @@ abstract class Feed
             foreach ($userlist as $item) {
                 if ($mode == 'bayut') {
                     $userresult[$item['ID']] = [
+                        'User_ID' => $item['ID'],
                         'Listing_Agent' => $item['NAME'] . ' ' . $item['LAST_NAME'],
                         'Listing_Agent_Phone' => $item['WORK_PHONE'],
                         'Listing_Agent_Email' => $item['EMAIL']
