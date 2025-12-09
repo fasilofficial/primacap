@@ -254,107 +254,108 @@ class FeedPf extends Feed
         \Bitrix\Main\Diag\Debug::writeToFile('--- PF User Sync Started --- ' . $timestamp, '', $logFile);
 
         $httpClient = self::getHttpClient();
-        $url = 'https://atlas.propertyfinder.com/v1/users/';
-        $queryParams = [
-            'status' => 'active',
-            'page' => 1,
-            'perPage' => 100
-        ];
-        $fullUrl = $url . '?' . http_build_query($queryParams);
+        $baseUrl = 'https://atlas.propertyfinder.com/v1/users/';
 
-        \Bitrix\Main\Diag\Debug::writeToFile("Request URL: {$fullUrl}", '', $logFile);
+        $pfUsers = [];
+        $page = 1;
+        $perPage = 100;
 
-        $response = $httpClient->get($fullUrl);
-        $status = $httpClient->getStatus();
-
-        \Bitrix\Main\Diag\Debug::writeToFile("HTTP Status: {$status}", '', $logFile);
-
-        if ($status == 200) {
-            $responseData = json_decode($response, true);
-            if (!isset($responseData['data'])) {
-                \Bitrix\Main\Diag\Debug::writeToFile('No data key found in API response', '', $logFile);
-                return;
-            }
-
-            // Map PF users: email => PFID
-            $pfUsers = [];
-            foreach ($responseData['data'] as $item) {
-                $email = mb_strtolower($item['email']);
-                $pfUsers[$email] = $item['publicProfile']['id'];
-            }
-
-            \Bitrix\Main\Diag\Debug::writeToFile('Fetched Users from PF API: ' . print_r($pfUsers, true), '', $logFile);
-
-            // Fetch Bitrix users who have PFID set or match PF emails
-            $bitrixUsers = \Bitrix\Main\UserTable::getList([
-                'filter' => [
-                    [
-                        'LOGIC' => 'OR',
-                        '@EMAIL' => array_keys($pfUsers),
-                        '!UF_PFID' => false // includes users with PFID set
-                    ]
-                ],
-                'select' => ['ID', 'EMAIL', 'UF_PFID']
-            ])->fetchAll();
-
-            \Bitrix\Main\Diag\Debug::writeToFile('Matching Bitrix Users: ' . print_r($bitrixUsers, true), '', $logFile);
-
-            $userObj = new \CUser;
-
-            $manualEmailMap = [
-                // bitrix email => pf email
-                'pouya@primocapital.ae' => 'admin@primocapital.ae',
-                'joach@primocapital.ae' => 'jhela@primocapital.ae'
+        do {
+            $queryParams = [
+                'status'  => 'active',
+                'page'    => $page,
+                'perPage' => $perPage
             ];
+            $fullUrl = $baseUrl . '?' . http_build_query($queryParams);
 
-            foreach ($bitrixUsers as $user) {
-                $email = mb_strtolower($user['EMAIL']);
+            \Bitrix\Main\Diag\Debug::writeToFile("Fetching PF page {$page}: {$fullUrl}", '', $logFile);
 
-                // Use mapped email if it exists
-                $pfLookupEmail = $manualEmailMap[$email] ?? $email;
+            $response = $httpClient->get($fullUrl);
+            $status   = $httpClient->getStatus();
 
-                $currentPfId = $user['UF_PFID'];
-                $newPfId = $pfUsers[$pfLookupEmail] ?? null;
+            if ($status !== 200) {
+                \Bitrix\Main\Diag\Debug::writeToFile("API error on page {$page}, status: {$status}", '', $logFile);
+                break;
+            }
 
-                // Case 1: User exists in PF but PFID differs → update
-                if ($newPfId && $currentPfId != $newPfId) {
-                    $fields = [
-                        "UF_PFID" => $newPfId,
-                        "UF_PFOP" => static::$offplan
-                    ];
-                    $userObj->Update($user['ID'], $fields);
-                    \Bitrix\Main\Diag\Debug::writeToFile(
-                        "Updated user {$email} using lookup {$pfLookupEmail} (ID: {$user['ID']}) with PFID: {$newPfId}",
-                        '',
-                        $logFile
-                    );
-                }
+            $data = json_decode($response, true);
 
-                // Case 2: User no longer exists in PF but still has PFID → clear
-                // elseif (!$newPfId && $currentPfId) {
-                //     $fields = [
-                //         "UF_PFID" => null,
-                //         "UF_PFOP" => null
-                //     ];
-                //     $userObj->Update($user['ID'], $fields);
-                //     \Bitrix\Main\Diag\Debug::writeToFile(
-                //         "Cleared PFID for {$email} (ID: {$user['ID']}) — not found in PF API",
-                //         '',
-                //         $logFile
-                //     );
-                // }
+            if (empty($data['data'])) {
+                \Bitrix\Main\Diag\Debug::writeToFile("No more data on page {$page}", '', $logFile);
+                break;
+            }
 
-                // Case 3: No change needed
-                else {
-                    \Bitrix\Main\Diag\Debug::writeToFile(
-                        "No update needed for {$email} (PFID: {$currentPfId} PF Lookup: {$pfLookupEmail})",
-                        '',
-                        $logFile
-                    );
+            foreach ($data['data'] as $item) {
+                $email = mb_strtolower(trim($item['email']));
+                if ($email && !empty($item['publicProfile']['id'])) {
+                    $pfUsers[$email] = $item['publicProfile']['id'];
                 }
             }
-        } else {
-            \Bitrix\Main\Diag\Debug::writeToFile("API request failed with status: {$status}", '', $logFile);
+
+            $page++;
+        } while (count($data['data']) === $perPage);
+
+        \Bitrix\Main\Diag\Debug::writeToFile('Total active PF users fetched: ' . count($pfUsers), '', $logFile);
+        \Bitrix\Main\Diag\Debug::writeToFile('PF users list: ' . print_r($pfUsers, true), '', $logFile);
+
+        if (empty($pfUsers)) {
+            \Bitrix\Main\Diag\Debug::writeToFile('No active users returned from PF API', '', $logFile);
+            \Bitrix\Main\Diag\Debug::writeToFile('--- PF User Sync Completed (no data) --- ' . $timestamp, '', $logFile);
+            return;
+        }
+
+        // === Get Bitrix users that have matching emails ===
+        $bitrixUsers = \Bitrix\Main\UserTable::getList([
+            'filter' => ['@EMAIL' => array_keys($pfUsers)],
+            'select' => ['ID', 'EMAIL', 'UF_PFID']
+        ])->fetchAll();
+
+        \Bitrix\Main\Diag\Debug::writeToFile('Bitrix users to check: ' . count($bitrixUsers), '', $logFile);
+
+        $userObj = new \CUser;
+
+        // Manual fixes for wrong/old emails in Bitrix
+        $manualEmailMap = [
+            'pouya@primocapital.ae' => 'admin@primocapital.ae',
+            'joach@primocapital.ae'  => 'jhela@primocapital.ae',
+            // add more if needed
+        ];
+
+        foreach ($bitrixUsers as $user) {
+            $email         = mb_strtolower($user['EMAIL']);
+            $lookupEmail   = $manualEmailMap[$email] ?? $email;
+            $currentPfId   = $user['UF_PFID'];
+            $newPfId       = $pfUsers[$lookupEmail] ?? null;
+
+            // If user already has a PFID → do absolutely nothing (even if it's wrong)
+            if (!empty($currentPfId)) {
+                \Bitrix\Main\Diag\Debug::writeToFile(
+                    "Skipped {$email} (ID: {$user['ID']}) — already has PFID: {$currentPfId}",
+                    '',
+                    $logFile
+                );
+                continue;
+            }
+
+            // Only add PFID if we found a match and user has none
+            if ($newPfId) {
+                $userObj->Update($user['ID'], [
+                    'UF_PFID' => $newPfId,
+                    'UF_PFOP' => static::$offplan
+                ]);
+
+                \Bitrix\Main\Diag\Debug::writeToFile(
+                    "Added PFID {$newPfId} to {$email} (Bitrix ID: {$user['ID']}) using lookup → {$lookupEmail}",
+                    '',
+                    $logFile
+                );
+            } else {
+                \Bitrix\Main\Diag\Debug::writeToFile(
+                    "No active PF account found for {$email} (tried: {$lookupEmail}) → left empty",
+                    '',
+                    $logFile
+                );
+            }
         }
 
         \Bitrix\Main\Diag\Debug::writeToFile('--- PF User Sync Completed --- ' . $timestamp, '', $logFile);
