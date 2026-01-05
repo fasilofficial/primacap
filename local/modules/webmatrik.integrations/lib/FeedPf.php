@@ -894,6 +894,43 @@ class FeedPf extends Feed
         }
     }
 
+    private function normalizePriceAmounts(array &$payload)
+    {
+        if (
+            empty($payload['price']['type']) ||
+            empty($payload['price']['amounts']) ||
+            !is_array($payload['price']['amounts'])
+        ) {
+            return;
+        }
+
+        $type = $payload['price']['type'];
+
+        // Map PF price types to amounts key
+        $map = [
+            'sale'    => 'sale',
+            'yearly'  => 'yearly',
+            'monthly' => 'monthly',
+            'weekly'  => 'weekly',
+            'daily'   => 'daily',
+        ];
+
+        if (!isset($map[$type])) {
+            return;
+        }
+
+        $key = $map[$type];
+
+        if (!isset($payload['price']['amounts'][$key])) {
+            return;
+        }
+
+        // Keep ONLY the correct amount
+        $payload['price']['amounts'] = [
+            $key => $payload['price']['amounts'][$key]
+        ];
+    }
+
     public function updateListing($pfListingId, $bitrixListingId)
     {
         if (!$pfListingId || !$bitrixListingId) {
@@ -958,6 +995,9 @@ class FeedPf extends Feed
 
         // Step 3: Merge CRM payload into PF payload
         $mergedPayload = $this->deepMerge($pfPayload, $crmPayload);
+
+        // 🔑 Fix price.amounts issue
+        $this->normalizePriceAmounts($mergedPayload);
 
         // Clean invalid structures expected as objects
         $this->cleanPfPayload($mergedPayload);
