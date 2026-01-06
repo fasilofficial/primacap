@@ -27,7 +27,7 @@ class Agent
     public static function syncPfLocations()
     {
         $obj = new FeedPf();
-        $cities = ['Dubai', 'Abu Dhabi', 'Sharjah', 'Ajman', 'Ras Al Khaimah'];
+        $cities = ['Dubai', 'Abu Dhabi', 'Sharjah', 'Ajman', 'Ras Al Khaimah', 'Fujairah', 'Umm Al Quwain'];
 
         foreach ($cities as $city) {
             $obj->syncLocations($city);
