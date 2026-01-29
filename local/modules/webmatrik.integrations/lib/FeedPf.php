@@ -610,7 +610,15 @@ class FeedPf extends Feed
             throw new \Exception('No data for export. Please check portals field');
         } else {
             $data = self::prepareListing(current($data));
-            //print_r($data);
+
+            // add missing compliance license number
+            if (
+                !isset($data['compliance']['issuingClientLicenseNumber']) ||
+                empty($data['compliance']['issuingClientLicenseNumber'])
+            ) {
+                $data['compliance']['issuingClientLicenseNumber'] = '1011138';
+            }
+
             $lisid = self::deliverListing($data);
             return $lisid;
         }
