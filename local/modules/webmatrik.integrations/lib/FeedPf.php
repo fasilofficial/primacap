@@ -610,15 +610,7 @@ class FeedPf extends Feed
             throw new \Exception('No data for export. Please check portals field');
         } else {
             $data = self::prepareListing(current($data));
-
-            // add missing compliance license number
-            if (
-                !isset($data['compliance']['issuingClientLicenseNumber']) ||
-                empty($data['compliance']['issuingClientLicenseNumber'])
-            ) {
-                $data['compliance']['issuingClientLicenseNumber'] = '1011138';
-            }
-
+            //print_r($data);
             $lisid = self::deliverListing($data);
             return $lisid;
         }
@@ -786,6 +778,17 @@ class FeedPf extends Feed
                     // No amenities allowed for this type
                     $data['amenities'] = [];
                 }
+            }
+
+            // add missing compliance license number
+            if (
+                isset($data['compliance']) &&
+                (
+                    !isset($data['compliance']['issuingClientLicenseNumber']) ||
+                    empty($data['compliance']['issuingClientLicenseNumber'])
+                )
+            ) {
+                $data['compliance']['issuingClientLicenseNumber'] = '1011138';
             }
 
             return $data;
