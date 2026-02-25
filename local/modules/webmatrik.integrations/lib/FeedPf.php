@@ -307,7 +307,7 @@ class FeedPf extends Feed
         // === Get Bitrix users that have matching emails ===
         $bitrixUsers = \Bitrix\Main\UserTable::getList([
             'filter' => ['@EMAIL' => array_keys($pfUsers)],
-            'select' => ['ID', 'EMAIL', 'UF_PFID']
+            'select' => ['ID', 'EMAIL', 'UF_PFID', 'UF_PFID_OP']
         ])->fetchAll();
 
         \Bitrix\Main\Diag\Debug::writeToFile('Bitrix users to check: ' . count($bitrixUsers), '', $logFile);
@@ -658,6 +658,7 @@ class FeedPf extends Feed
 
     protected function prepareListing(array $data)
     {
+        file_put_contents(__DIR__ . '/listing.json', json_encode($data));
         $reserr = [];
         $resdescr = [];
         if (!$data['price']['amounts']['sum']) {

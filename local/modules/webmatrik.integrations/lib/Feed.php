@@ -236,7 +236,7 @@ abstract class Feed
             if ($mode == 'bayut') {
                 $select = ['ID', 'NAME', 'LAST_NAME', 'WORK_PHONE', 'EMAIL'];
             } elseif ($mode == 'Pf') {
-                $select = ['ID', 'UF_PFID', 'UF_PFOP'];
+                $select = ['ID', 'UF_PFID', 'UF_PFOP', 'UF_PFID_OP'];
             }
             //print_r($users);
             $userlist = \Bitrix\Main\UserTable::getList(array(
@@ -257,8 +257,8 @@ abstract class Feed
                         'Listing_Agent_Email' => $item['EMAIL']
                     ];
                 } elseif ($mode == 'Pf') {
-                    if ($item['UF_PFOP'] == static::$offplan) {
-                        $userresult[$item['ID']] = (int)$item['UF_PFID'];
+                    if ($item['UF_PFOP'] == static::$offplan || isset($item['UF_PFID_OP'])) {
+                        $userresult[$item['ID']] = isset($item['UF_PFID_OP']) ? (int)$item['UF_PFID_OP'] : (int)$item['UF_PFID'];
                     } else {
                         $userresult[$item['ID']] = '';
                     }
