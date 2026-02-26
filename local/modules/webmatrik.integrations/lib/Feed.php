@@ -257,10 +257,23 @@ abstract class Feed
                         'Listing_Agent_Email' => $item['EMAIL']
                     ];
                 } elseif ($mode == 'Pf') {
-                    if ($item['UF_PFOP'] == static::$offplan || isset($item['UF_PFID_OP'])) {
-                        $userresult[$item['ID']] = isset($item['UF_PFID_OP']) ? (int)$item['UF_PFID_OP'] : (int)$item['UF_PFID'];
+                    if (
+                        $item['UF_PFOP'] == static::$offplan &&
+                        !empty($item['UF_PFOP']) &&
+                        !empty($item['UF_PFID_OP'])
+                    ) {
+                        // Use OP ID only when all conditions are satisfied
+                        $userresult[$item['ID']] = (int)$item['UF_PFID_OP'];
+                    } elseif ($item['UF_PFOP'] == static::$offplan && !empty($item['UF_PFID'])) {
+
+                        // Offplan but no OP ID → fallback to normal PFID
+                        $userresult[$item['ID']] = (int)$item['UF_PFID'];
                     } else {
-                        $userresult[$item['ID']] = '';
+
+                        // Secondary → always normal PFID
+                        $userresult[$item['ID']] = !empty($item['UF_PFID'])
+                            ? (int)$item['UF_PFID']
+                            : '';
                     }
                 }
             }
