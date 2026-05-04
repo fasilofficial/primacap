@@ -1447,6 +1447,67 @@ class FeedPf extends Feed
         return null;
     }
 
+    public function refreshListing($reference, $pfId)
+    {
+        if (!$reference || !$pfId) {
+            throw new \Exception('Reference and PF Listing ID are required for refresh');
+        }
+
+        $httpClient = self::getHttpClient();
+
+        // Step 1: Check if listing is LIVE
+        $isLive = false;
+        $bitrixId = null;
+
+        $response = $httpClient->get("https://atlas.propertyfinder.com/v1/listings?" . http_build_query([
+            'filter' => ['ids' => $pfId]
+        ]));
+
+        if ($httpClient->getStatus() === 200) {
+            $decoded = json_decode($response, true);
+            if (!empty($decoded['results'][0])) {
+                $isLive = true;
+            }
+        }
+
+        // Step 2: Resolve Bitrix listing ID by reference
+        $factory = \Bitrix\Crm\Service\Container::getInstance()->getFactory(static::$entityTypeId);
+        if (!$factory) {
+            throw new \Exception('Factory not found for listing entity');
+        }
+
+        $items = $factory->getItems([
+            'select' => ['ID', 'UF_CRM_5_1752571265'],
+            'filter' => ['=UF_CRM_5_1752571265' => $reference],
+            'limit'  => 1,
+        ]);
+
+        if (empty($items)) {
+            throw new \Exception("No Bitrix listing found for reference: {$reference}");
+        }
+
+        $bitrixId = current($items)->getId();
+
+        // Step 3: Unpublish if live
+        if ($isLive) {
+            $this->unpublishListing($pfId);
+        }
+
+        // Step 4: Update
+        $this->updateListing($pfId, $bitrixId);
+
+        // Step 5: Publish
+        $this->publishListing($pfId);
+
+        \Bitrix\Main\Diag\Debug::writeToFile(
+            ['pfId' => $pfId, 'reference' => $reference, 'wasLive' => $isLive],
+            "PF Refresh SUCCESS " . date('Y-m-d H:i:s'),
+            "pfexport.log"
+        );
+
+        return true;
+    }
+
     /*public function setLocations()
     {
         //$token = self::makeAuth();
