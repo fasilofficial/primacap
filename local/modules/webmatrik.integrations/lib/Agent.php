@@ -46,4 +46,52 @@ class Agent
 
         return '\\' . __METHOD__ . '();';
     }
+
+    public static function fetchPfEmailLeads()
+    {
+        try {
+            $obj = new PfEmail();
+            $obj->fetchLeads();
+        } catch (\Throwable $e) {
+            \Bitrix\Main\Diag\Debug::writeToFile(
+                $e->getMessage(),
+                'PfEmail Error ' . date('Y-m-d H:i:s'),
+                'pf_email_leads.log'
+            );
+        }
+
+        return '\\' . __METHOD__ . '();';
+    }
+
+    public static function fetchPfCallLeads()
+    {
+        try {
+            $obj = new PfCall();
+            $obj->fetchLeads();
+        } catch (\Throwable $e) {
+            \Bitrix\Main\Diag\Debug::writeToFile(
+                $e->getMessage(),
+                'PfCall Error ' . date('Y-m-d H:i:s'),
+                'pf_call_leads.log'
+            );
+        }
+
+        return '\\' . __METHOD__ . '();';
+    }
+
+    public static function fetchPfWhatsappLeads()
+    {
+        try {
+            $obj = new PfWhatsapp();
+            $obj->fetchLeads();
+        } catch (\Throwable $e) {
+            \Bitrix\Main\Diag\Debug::writeToFile(
+                $e->getMessage(),
+                'PfWhatsapp Error ' . date('Y-m-d H:i:s'),
+                'pf_whatsapp_leads.log'
+            );
+        }
+
+        return '\\' . __METHOD__ . '();';
+    }
 }

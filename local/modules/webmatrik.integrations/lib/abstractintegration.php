@@ -18,12 +18,24 @@ abstract class AbstractIntegration implements Integration
     protected $token;
     protected $subscribed = false;
     protected $assigned;
+    protected $leadiduf;
+    protected $leadid;
     protected $proplinkuf;
     protected $proprefuf;
     protected $contactlinkuf;
     protected $startwf;
     protected $wfid;
-    protected $apikey;
+    protected $ofplanApikey;
+    protected $secondaryApikey;
+    protected $clientnameuf;
+    protected $clientphoneuf;
+    protected $clientemailuf;
+    protected $pfproplinkuf;
+    protected $pfproprefuf;
+    protected $pfcontactlinkuf;
+    protected $pfagentiduf;
+    protected $pfstartwf;
+    protected $pfwfid;
 
 
     public function __construct()
@@ -31,22 +43,33 @@ abstract class AbstractIntegration implements Integration
         \Bitrix\Main\Loader::includeModule('crm');
         \Bitrix\Main\Loader::includeModule('bizproc');
         $this->assigned = static::getModuleOption('main_Lead_AssignedTo', '');
+        $this->leadiduf = static::getModuleOption('main_Lead_Id_UF', '');
+
+        $this->clientnameuf = static::getModuleOption('main_Client_Name_UF', '');
+        $this->clientphoneuf = static::getModuleOption('main_Client_Phone_UF', '');
+        $this->clientemailuf = static::getModuleOption('main_Client_Email_UF', '');
+
         $this->proplinkuf = static::getModuleOption('main_Bayut_Property_Link_UF', '');
         $this->proprefuf = static::getModuleOption('main_Bayut_Property_Ref_UF', '');
         $this->contactlinkuf = static::getModuleOption('main_Bayut_Contact_Link_UF', '');
         $this->startwf = static::getModuleOption('main_Bayut_Start_Deal_WF', '');
         $this->wfid = static::getModuleOption('main_Bayut_Start_Deal_WF_ID', '');
-        $this->apikey = static::getModuleOption('main_BayutDubizzle_API_KEY', '');
+
+        $this->ofplanApikey = static::getModuleOption('main_BayutDubizzle_OFFPLAN_API_KEY', '');
+        $this->secondaryApikey = static::getModuleOption('main_BayutDubizzle_SECONDARY_API_KEY', '');
+
+        $this->pfproplinkuf = static::getModuleOption('main_Pf_Property_Link_UF', '');
+        $this->pfproprefuf = static::getModuleOption('main_Pf_Property_Ref_UF', '');
+        $this->pfcontactlinkuf = static::getModuleOption('main_Pf_Contact_Link_UF', '');
+        $this->pfagentiduf = static::getModuleOption('main_Pf_Agent_Id_UF', '');
+        $this->pfstartwf = static::getModuleOption('main_Pf_Start_Deal_WF', '');
+        $this->pfwfid = static::getModuleOption('main_Pf_Start_Deal_WF_ID', '');
     }
 
     protected function isSubscribed()
     {
         $this->subscribed = true;
     }
-    /**
-     * @return void
-     */
-    //abstract public function processWebhook();
 
     /**
      * @param $dateStr
@@ -71,7 +94,29 @@ abstract class AbstractIntegration implements Integration
     }
 
     /**
-     * @param $yourdate
+     * Check if a deal with the given lead ID already exists in Bitrix.
+     */
+    protected function dealExistsForLeadId(string $leadId): bool
+    {
+        if (empty($this->leadiduf) || empty($leadId)) {
+            return false;
+        }
+
+        $existing = \CCrmDeal::GetListEx(
+            ['ID' => 'ASC'],
+            [
+                $this->leadiduf => $leadId,
+                'CHECK_PERMISSIONS' => 'N'
+            ],
+            false,
+            ['nTopCount' => 1],
+            ['ID']
+        );
+
+        return (bool) $existing->Fetch();
+    }
+
+    /**
      * @return void
      */
     public function createLead()
@@ -102,103 +147,133 @@ abstract class AbstractIntegration implements Integration
         }
     }
 
-
     public function createDeal(string $type = 'WA')
     {
-        if ($type == 'WA' || $type == 'phone') {
+        // Skip if deal already exists for this lead ID
+        if (!empty($this->leadid) && $this->dealExistsForLeadId($this->leadid)) {
+            return;
+        }
+
+        // Determine contact search method and workflow to use
+        $isPf = in_array($type, ['pf_email', 'pf_phone', 'WA']);
+
+        if (in_array($type, ['WA', 'pf_phone', 'phone'])) {
             $search = 'phone';
         } else {
             $search = 'email';
         }
+
         if ($contacts = $this->returnContact($search)) {
             $targetcontact = $contacts[0]['ID'];
         } else {
             $targetcontact = $this->addContact($search);
         }
-        if ($type == 'WA') {
-            $entityFields = [
-                'TITLE'    => $this->title,
-                'STAGE_ID' => "C2:NEW",
-                'CATEGORY_ID' => 2,
-                'CLOSED' => 'N',
-                'TYPE_ID' => 'SALE',
-                'CONTACT_ID' => $targetcontact,
-                'CONTACT_IDS' => [
-                    $targetcontact
-                ],
-                'OPENED' => 'Y',
-                'ASSIGNED_BY_ID' => 1,
-                'SOURCE_ID' =>  $this->source,
-                $this->proplinkuf => $this->proplinkufval,
+
+        // Build entity fields based on type
+        $baseFields = [
+            'TITLE'          => $this->title,
+            'STAGE_ID'       => "C2:NEW",
+            'CATEGORY_ID'    => 2,
+            'CLOSED'         => 'N',
+            'TYPE_ID'        => 'SALE',
+            'CONTACT_ID'     => $targetcontact,
+            'CONTACT_IDS'    => [$targetcontact],
+            'OPENED'         => 'Y',
+            'ASSIGNED_BY_ID' => 1,
+            'SOURCE_ID'      => $this->source,
+            $this->leadiduf  => $this->leadid,
+        ];
+
+        if ($type === 'WA') {
+            $entityFields = array_merge($baseFields, [
+                $this->proplinkuf      => $this->proplinkufval,
+                $this->proprefuf       => $this->proprefufval,
+                $this->contactlinkuf   => $this->contactlinkval,
+                $this->pfproplinkuf    => $this->pfproplinkufval,
+                $this->pfproprefuf     => $this->pfproprefufval,
+                $this->pfcontactlinkuf => $this->pfcontactlinkval,
+                $this->pfagentiduf     => $this->pfagentidufval,
+                $this->clientnameuf    => $this->name,
+                $this->clientphoneuf   => $this->phone,
+                $this->clientemailuf   => $this->email,
+            ]);
+        } elseif ($type === 'pf_email') {
+            $entityFields = array_merge($baseFields, [
+                $this->pfproprefuf     => $this->pfproprefufval,
+                $this->pfproplinkuf    => $this->pfproplinkufval,
+                $this->pfcontactlinkuf => $this->pfcontactlinkval,
+                $this->pfagentiduf     => $this->pfagentidufval,
+                $this->clientnameuf    => $this->name,
+                $this->clientphoneuf   => $this->phone,
+                $this->clientemailuf   => $this->email,
+            ]);
+        } elseif ($type === 'pf_phone') {
+            $entityFields = array_merge($baseFields, [
+                $this->pfproprefuf     => $this->pfproprefufval,
+                $this->pfproplinkuf    => $this->pfproplinkufval,
+                $this->pfcontactlinkuf => $this->pfcontactlinkval,
+                $this->pfagentiduf     => $this->pfagentidufval,
+                $this->clientnameuf    => $this->name,
+                $this->clientphoneuf   => $this->phone,
+                $this->clientemailuf   => $this->email,
+                'COMMENTS'             => $this->commentsval,
+            ]);
+        } elseif ($type === 'email') {
+            // Bayut email
+            $entityFields = array_merge($baseFields, [
                 $this->proprefuf => $this->proprefufval,
-                $this->contactlinkuf => $this->contactlinkval,
-            ];
-        } elseif ($type == 'email') {
-            $entityFields = [
-                'TITLE'    => $this->title,
-                'STAGE_ID' => "C2:NEW",
-                'CATEGORY_ID' => 2,
-                'CLOSED' => 'N',
-                'TYPE_ID' => 'SALE',
-                'CONTACT_ID' => $targetcontact,
-                'CONTACT_IDS' => [
-                    $targetcontact
-                ],
-                'OPENED' => 'Y',
-                'ASSIGNED_BY_ID' => 1,
-                'SOURCE_ID' =>  $this->source,
+                'COMMENTS'      => $this->comment,
+            ]);
+        } elseif ($type === 'phone') {
+            // Bayut phone
+            $entityFields = array_merge($baseFields, [
                 $this->proprefuf => $this->proprefufval,
-            ];
-        } elseif ($type == 'phone') {
-            $entityFields = [
-                'TITLE'    => $this->title,
-                'STAGE_ID' => "C2:NEW",
-                'CATEGORY_ID' => 2,
-                'CLOSED' => 'N',
-                'TYPE_ID' => 'SALE',
-                'CONTACT_ID' => $targetcontact,
-                'CONTACT_IDS' => [
-                    $targetcontact
-                ],
-                'OPENED' => 'Y',
-                'ASSIGNED_BY_ID' => 1,
-                'SOURCE_ID' =>  $this->source,
-                $this->proprefuf => $this->proprefufval,
-            ];
+            ]);
         }
 
         $entityObject = new \CCrmDeal(false);
-        $entityId = $entityObject->Add(
-            $entityFields
-        );
+        $entityId = $entityObject->Add($entityFields);
 
         if ($entityId) {
-            if ($this->startwf == 'Y' and $this->wfid) {
-                $deal = 'DEAL_' . $entityId;
-                $arWorkflowParameters = [];
-                $arErrorsTmp = [];
-                $wfId = \CBPDocument::StartWorkflow(
-                    $this->wfid, // константа шаблона БП
-                    array("crm", "CCrmDocumentDeal", $deal),
-                    $arWorkflowParameters,
-                    $arErrorsTmp
-                );
-            }
-            if ($type == 'email' || $type == 'phone') {
-                if ($this->comment) {
-                    $entryId = \Bitrix\Crm\Timeline\CommentEntry::create([
-                        'TEXT' => $this->comment,
-                        'SETTINGS' => ['HAS_FILES' => 'N'],
-                        'AUTHOR_ID' => 1,
-                        'BINDINGS' => [['ENTITY_TYPE_ID' => \CCrmOwnerType::Deal, 'ENTITY_ID' => $entityId]]
-                    ]);
+            // Start workflow — PF types use pfstartwf/pfwfid, Bayut types use startwf/wfid
+            if ($isPf) {
+                if ($this->pfstartwf == 'Y' && $this->pfwfid) {
+                    $deal = 'DEAL_' . $entityId;
+                    $arWorkflowParameters = [];
+                    $arErrorsTmp = [];
+                    \CBPDocument::StartWorkflow(
+                        $this->pfwfid,
+                        ["crm", "CCrmDocumentDeal", $deal],
+                        $arWorkflowParameters,
+                        $arErrorsTmp
+                    );
                 }
+            } else {
+                if ($this->startwf == 'Y' && $this->wfid) {
+                    $deal = 'DEAL_' . $entityId;
+                    $arWorkflowParameters = [];
+                    $arErrorsTmp = [];
+                    \CBPDocument::StartWorkflow(
+                        $this->wfid,
+                        ["crm", "CCrmDocumentDeal", $deal],
+                        $arWorkflowParameters,
+                        $arErrorsTmp
+                    );
+                }
+            }
+
+            // Add comment for non-WA types
+            if ($type !== 'WA' && $this->comment) {
+                \Bitrix\Crm\Timeline\CommentEntry::create([
+                    'TEXT'     => $this->comment,
+                    'SETTINGS' => ['HAS_FILES' => 'N'],
+                    'AUTHOR_ID' => 1,
+                    'BINDINGS' => [['ENTITY_TYPE_ID' => \CCrmOwnerType::Deal, 'ENTITY_ID' => $entityId]]
+                ]);
             }
         } else {
             print_r($entityObject->LAST_ERROR);
         }
-
-        //print_r($targetcontact);
     }
 
     protected function returnContact($type)
@@ -208,7 +283,7 @@ abstract class AbstractIntegration implements Integration
             $arFilter = array(
                 'FM' => array(
                     array(
-                        'TYPE_ID' => 'phone',
+                        'TYPE_ID'        => 'phone',
                         $searchCondition => $this->phone
                     )
                 ),
@@ -218,7 +293,7 @@ abstract class AbstractIntegration implements Integration
             $arFilter = array(
                 'FM' => array(
                     array(
-                        'TYPE_ID' => 'email',
+                        'TYPE_ID'        => 'email',
                         $searchCondition => $this->email
                     )
                 ),
@@ -240,10 +315,9 @@ abstract class AbstractIntegration implements Integration
         return $arResult;
     }
 
-
     protected function addContact($type)
     {
-        if ($type = 'email') {
+        if ($type == 'email') {
             $fm = [
                 "PHONE" => [
                     "n0" => [
@@ -269,30 +343,29 @@ abstract class AbstractIntegration implements Integration
             ];
         }
         $contactFields = [
-            'NAME' => $this->name,
-            "FM"  => $fm,
-            "OPENED" => "Y", // "Доступен для всех" = Да
+            'NAME'           => $this->name,
+            "FM"             => $fm,
+            "OPENED"         => "Y",
             "ASSIGNED_BY_ID" => $this->assigned,
-            "SOURCE_ID" => $this->source
+            "SOURCE_ID"      => $this->source
         ];
         $contactEntity = new \CCrmContact(false);
-        $contactId = $contactEntity->Add(
-            $contactFields
-        );
+        $contactId = $contactEntity->Add($contactFields);
 
         return isset($contactId) ? $contactId : false;
     }
+
     /**
      * @param $yourdate
      * @return void
      */
     protected function isWinter(\Bitrix\Main\Type\DateTime $yourdate)
     {
-        $day = $yourdate->format('d');
+        $day   = $yourdate->format('d');
         $month = $yourdate->format('m');
-        $year = $yourdate->format('Y');
+        $year  = $yourdate->format('Y');
 
-        $cy =  date("Y");
+        $cy = date("Y");
 
         $winter = false;
 
@@ -301,23 +374,35 @@ abstract class AbstractIntegration implements Integration
         }
 
         if ($winter) {
-            $yourdate->modify("-1 hour"); // 1 hour back
+            $yourdate->modify("-1 hour");
         }
     }
 
+    protected function getApiKey($branch)
+    {
+        switch ($branch) {
+            case 'offplan':
+                return $this->ofplanApikey;
+            case 'secondary':
+                return $this->secondaryApikey;
+        }
+    }
     /**
      * @param $type
      * @param $url
      * @return array
      */
-    protected function sendCurlRequest($type, $url)
+    protected function sendCurlRequest($type, $url, $branch)
     {
         try {
-            // Bayut requires raw timestamp, no URL encoding
             $date = date('Y-m-d H:i:s', strtotime('-1 minutes'));
 
-            // Build query manually
+            // Testing
+            $date = '2024-06-01 00:00:00';
+
             $url = $url . '?type=' . $type . '&timestamp=' . $date;
+
+            $apiKey = $this->getApiKey($branch);
 
             $curl = curl_init();
             $options = [
@@ -329,7 +414,7 @@ abstract class AbstractIntegration implements Integration
                 CURLOPT_HTTP_VERSION   => CURL_HTTP_VERSION_1_1,
                 CURLOPT_CUSTOMREQUEST  => 'GET',
                 CURLOPT_HTTPHEADER     => [
-                    "Authorization: Bearer " . $this->apikey,
+                    "Authorization: Bearer " . $apiKey,
                 ],
             ];
 
@@ -387,7 +472,6 @@ abstract class AbstractIntegration implements Integration
     }
 
     /**
-     * logging. TODO: monologging
      * @param $data
      * @param $sHeader
      * @param $sFilePath
@@ -395,9 +479,7 @@ abstract class AbstractIntegration implements Integration
      */
     public static function dump($data, $sHeader = null, $sFilePath = "__mylog_integrations.log")
     {
-
         $sHeader = ($sHeader != null ? $sHeader . '   ' : '') . date('l jS \of F Y h:i:s A');
-
         \Bitrix\Main\Diag\Debug::dumpToFile($data, $sHeader, $sFilePath);
     }
 
