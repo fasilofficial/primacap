@@ -706,7 +706,7 @@ class FeedPf extends Feed
 
             if (!empty($validTypes)) {
                 if (empty($data['compliance']['listingAdvertisementNumber'])) {
-                    $reserr[] = 'listingAdvertisementNumber';
+                    $reserr[] = 'listingAdvertisementNumber (Permit No.)';
                 }
 
                 $compType = $data['compliance']['type'] ?? null;
@@ -842,12 +842,13 @@ class FeedPf extends Feed
             \Bitrix\Main\Diag\Debug::writeToFile($response, "error exp " . date('Y-m-d H:i:s'), "pfexport.log");
             $err = json_decode($response, true);
             print_r($err);
+            $parsedError = self::parseErrorMessage($response);
             if (str_contains($response, 'reference already exists')) {
-                throw new \Exception('Error in creating listing - reference is not unique');
+                throw new \Exception('Error in creating listing - reference is not unique. Details: ' . $parsedError);
             } elseif (str_contains($response, 'does not match authenticated user')) {
-                throw new \Exception('Error in creating listing - assigned agent not registered for Pf account');
+                throw new \Exception('Error in creating listing - assigned agent not registered for Pf account. Details: ' . $parsedError);
             } else {
-                throw new \Exception('Error in creating listing - please contact service desk');
+                throw new \Exception('Error in creating listing. HTTP ' . $status . ': ' . $parsedError);
             }
         }
     }
@@ -1039,7 +1040,8 @@ class FeedPf extends Feed
             return true;
         }
 
-        throw new \Exception("Failed to update listing. HTTP {$status}: {$responseBody}");
+        $parsedError = self::parseErrorMessage($responseBody);
+        throw new \Exception("Failed to update listing. HTTP {$status}: {$parsedError}");
     }
 
     public function submitListingVerification($pfListingId)
@@ -1126,7 +1128,8 @@ class FeedPf extends Feed
             return $response;
         }
 
-        throw new \Exception("Failed to submit listing for verification. HTTP {$status}: {$responseBody}");
+        $parsedError = self::parseErrorMessage($responseBody);
+        throw new \Exception("Failed to submit listing for verification. HTTP {$status}: {$parsedError}");
     }
 
     public function getCreditBalance()
@@ -1172,7 +1175,8 @@ class FeedPf extends Feed
                 "PF Publish Failed " . date('Y-m-d H:i:s'),
                 "pfexport.log"
             );
-            throw new \Exception("Failed to publish listing {$listingId}. HTTP {$status}: " . ($error['detail'] ?? $response));
+            $parsedError = self::parseErrorMessage($response);
+            throw new \Exception("Failed to publish listing {$listingId}. HTTP {$status}: {$parsedError}");
         }
     }
 
@@ -1201,7 +1205,8 @@ class FeedPf extends Feed
                 "PF Unpublish Failed " . date('Y-m-d H:i:s'),
                 "pfexport.log"
             );
-            throw new \Exception("Failed to unpublish listing {$listingId}. HTTP {$status}: " . ($error['detail'] ?? $response));
+            $parsedError = self::parseErrorMessage($response);
+            throw new \Exception("Failed to unpublish listing {$listingId}. HTTP {$status}: {$parsedError}");
         }
     }
 
@@ -1232,7 +1237,8 @@ class FeedPf extends Feed
                 "PF Delete Failed " . date('Y-m-d H:i:s'),
                 "pfexport.log"
             );
-            throw new \Exception("Failed to delete listing {$listingId}. HTTP {$status}: " . ($error['detail'] ?? $response));
+            $parsedError = self::parseErrorMessage($response);
+            throw new \Exception("Failed to delete listing {$listingId}. HTTP {$status}: {$parsedError}");
         }
     }
 
@@ -1550,4 +1556,77 @@ class FeedPf extends Feed
             }
         }
     }*/
+
+    private static function parseErrorMessage($response)
+    {
+        if (empty($response)) {
+            return 'empty response';
+        }
+
+        // Try to decode as JSON
+        $data = json_decode($response, true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($data)) {
+            return $response;
+        }
+
+        $messages = [];
+
+        // Check if there are errors array
+        if (!empty($data['errors']) && is_array($data['errors'])) {
+            foreach ($data['errors'] as $err) {
+                if (is_array($err)) {
+                    $detail = $err['detail'] ?? $err['en'] ?? $err['message'] ?? $err['msg'] ?? '';
+                    if (!empty($detail)) {
+                        // The detail itself might contain a stringified JSON
+                        if (preg_match('/request failed:\s*(\{.*\})/i', $detail, $matches)) {
+                            $innerJson = $matches[1];
+                            $innerMsg = self::parseErrorMessage($innerJson);
+                            if ($innerMsg) {
+                                $messages[] = $innerMsg;
+                                continue;
+                            }
+                        }
+                        
+                        // Or if there is a pointer like /bedrooms, let's include it
+                        $pointerInfo = '';
+                        if (!empty($err['pointer'])) {
+                            $pointerInfo = ' (' . ltrim($err['pointer'], '/') . ')';
+                        }
+                        
+                        $messages[] = $detail . $pointerInfo;
+                    }
+                } elseif (is_string($err)) {
+                    $messages[] = $err;
+                }
+            }
+        }
+
+        // Check for top-level detail
+        if (!empty($data['detail']) && is_string($data['detail'])) {
+            $detail = $data['detail'];
+            if (preg_match('/request failed:\s*(\{.*\})/i', $detail, $matches)) {
+                $innerJson = $matches[1];
+                $innerMsg = self::parseErrorMessage($innerJson);
+                if ($innerMsg) {
+                    $messages[] = $innerMsg;
+                }
+            } else {
+                $messages[] = $detail;
+            }
+        }
+
+        // If we found specific messages, join them
+        if (!empty($messages)) {
+            // Remove duplicates and empty messages
+            $messages = array_unique(array_filter(array_map('trim', $messages)));
+            return implode('; ', $messages);
+        }
+
+        // If no details, but there's a title/type
+        if (!empty($data['title'])) {
+            return $data['title'] . (!empty($data['type']) ? ' (' . $data['type'] . ')' : '');
+        }
+
+        return $response;
+    }
 }

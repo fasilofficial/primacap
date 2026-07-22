@@ -1553,4 +1553,107 @@ class FeedBayut extends Feed
             }
         }
     }
+
+    private static function parseErrorMessage($response)
+    {
+        if (empty($response)) {
+            return 'empty response';
+        }
+
+        // Try to decode as JSON if string, or use directly if array
+        $data = is_array($response) ? $response : json_decode($response, true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($data)) {
+            return is_string($response) ? $response : (is_array($response) ? json_encode($response) : (string)$response);
+        }
+
+        $messages = [];
+
+        // Check if there are errors field
+        if (!empty($data['errors'])) {
+            if (is_array($data['errors'])) {
+                foreach ($data['errors'] as $field => $err) {
+                    if (is_array($err)) {
+                        foreach ($err as $subErr) {
+                            if (is_array($subErr)) {
+                                $detail = $subErr['detail'] ?? $subErr['en'] ?? $subErr['message'] ?? $subErr['msg'] ?? '';
+                                if (!empty($detail)) {
+                                    if (preg_match('/request failed:\s*(\{.*\})/i', $detail, $matches)) {
+                                        $innerMsg = self::parseErrorMessage($matches[1]);
+                                        if ($innerMsg) {
+                                            $messages[] = $innerMsg;
+                                            continue;
+                                        }
+                                    }
+                                    $pointerInfo = !empty($subErr['pointer']) ? ' (' . ltrim($subErr['pointer'], '/') . ')' : '';
+                                    $messages[] = trim($detail . $pointerInfo);
+                                }
+                            } elseif (is_string($subErr) && !empty(trim($subErr))) {
+                                $messages[] = trim($subErr);
+                            }
+                        }
+                    } elseif (is_string($err) && !empty(trim($err))) {
+                        $messages[] = trim($err);
+                    }
+                }
+            } elseif (is_string($data['errors'])) {
+                $messages[] = trim($data['errors']);
+            }
+        }
+
+        // Check top-level message
+        if (!empty($data['message']) && is_string($data['message'])) {
+            $msg = trim($data['message']);
+            if (preg_match('/request failed:\s*(\{.*\})/i', $msg, $matches)) {
+                $innerMsg = self::parseErrorMessage($matches[1]);
+                if ($innerMsg) {
+                    $messages[] = $innerMsg;
+                }
+            } else {
+                $messages[] = $msg;
+            }
+        }
+
+        // Check top-level detail
+        if (!empty($data['detail']) && is_string($data['detail'])) {
+            $detail = trim($data['detail']);
+            if (preg_match('/request failed:\s*(\{.*\})/i', $detail, $matches)) {
+                $innerMsg = self::parseErrorMessage($matches[1]);
+                if ($innerMsg) {
+                    $messages[] = $innerMsg;
+                }
+            } else {
+                $messages[] = $detail;
+            }
+        }
+
+        // Check top-level error
+        if (!empty($data['error']) && is_string($data['error'])) {
+            $messages[] = trim($data['error']);
+        }
+
+        // Check top-level title
+        if (!empty($data['title']) && is_string($data['title'])) {
+            $titleMsg = trim($data['title']);
+            if (!empty($data['type'])) {
+                $titleMsg .= ' (' . $data['type'] . ')';
+            }
+            $messages[] = $titleMsg;
+        }
+
+        // Check top-level reference/category if set and string
+        if (!empty($data['reference']) && is_string($data['reference'])) {
+            $messages[] = trim($data['reference']);
+        }
+        if (!empty($data['category']) && is_string($data['category'])) {
+            $messages[] = trim($data['category']);
+        }
+
+        // If we found specific messages, filter and return unique non-empty messages
+        if (!empty($messages)) {
+            $uniqueMessages = array_values(array_unique(array_filter($messages)));
+            return implode('; ', $uniqueMessages);
+        }
+
+        return is_string($response) ? $response : json_encode($response);
+    }
 }
