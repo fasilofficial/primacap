@@ -607,6 +607,9 @@ class FeedPf extends Feed
         ];
         $data = static::retrieveDate($filter, 'Pf');
         if (!$data) {
+            $data = static::retrieveDate(['ID' => $lisId], 'Pf');
+        }
+        if (!$data) {
             throw new \Exception('No data for export. Please check portals field');
         } else {
             $data = self::prepareListing(current($data));
@@ -829,7 +832,7 @@ class FeedPf extends Feed
 
         $status = $httpClient->getStatus();
 
-        if ($status == 200) {
+        if ($status == 200 || $status == 201) {
             $responseData = json_decode($response, true);
             print_r($responseData);
             \Bitrix\Main\Diag\Debug::writeToFile($responseData, "success exp " . date('Y-m-d H:i:s'), "pfexport.log");
@@ -1216,28 +1219,54 @@ class FeedPf extends Feed
 
         $url = "https://atlas.propertyfinder.com/v1/listings/{$listingId}";
 
-        $response = $httpClient->query(
+        $httpClient->query(
             \Bitrix\Main\Web\HttpClient::HTTP_DELETE,
             $url
         );
 
         $status = $httpClient->getStatus();
+        $responseBody = $httpClient->getResult();
 
-        if ($status === 204 || $status === 200) {
+        if ($status === 204 || $status === 200 || $status === 404) {
             \Bitrix\Main\Diag\Debug::writeToFile(
-                ['listingId' => $listingId, 'action' => 'delete'],
+                ['listingId' => $listingId, 'action' => 'delete', 'status' => $status],
                 "PF Delete Success " . date('Y-m-d H:i:s'),
                 "pfexport.log"
             );
             return true;
+        }
+
+        // If direct delete returned an error (e.g. 400/409 because listing was published/live), attempt unpublish then retry delete
+        try {
+            $this->unpublishListing($listingId);
+        } catch (\Throwable $e) {
+            // Ignore unpublish error
+        }
+
+        $httpClient = self::getHttpClient();
+        $httpClient->query(
+            \Bitrix\Main\Web\HttpClient::HTTP_DELETE,
+            $url
+        );
+
+        $status = $httpClient->getStatus();
+        $responseBody = $httpClient->getResult();
+
+        if ($status === 204 || $status === 200 || $status === 404) {
+            \Bitrix\Main\Diag\Debug::writeToFile(
+                ['listingId' => $listingId, 'action' => 'delete', 'status' => $status],
+                "PF Delete Success (after unpublish) " . date('Y-m-d H:i:s'),
+                "pfexport.log"
+            );
+            return true;
         } else {
-            $error = json_decode($response, true);
+            $error = json_decode($responseBody, true);
             \Bitrix\Main\Diag\Debug::writeToFile(
                 ['listingId' => $listingId, 'action' => 'delete', 'error' => $error, 'status' => $status],
                 "PF Delete Failed " . date('Y-m-d H:i:s'),
                 "pfexport.log"
             );
-            $parsedError = self::parseErrorMessage($response);
+            $parsedError = self::parseErrorMessage($responseBody);
             throw new \Exception("Failed to delete listing {$listingId}. HTTP {$status}: {$parsedError}");
         }
     }
@@ -1453,62 +1482,223 @@ class FeedPf extends Feed
         return null;
     }
 
-    public function refreshListing($reference, $pfId)
+    public function refreshListing($pfId, $reference = null)
     {
-        if (!$reference || !$pfId) {
-            throw new \Exception('Reference and PF Listing ID are required for refresh');
+        if (!$pfId && !$reference) {
+            throw new \Exception('PF Listing ID or Reference is required for refresh');
         }
 
         $httpClient = self::getHttpClient();
+        $logFile = 'pfexport.log';
 
-        // Step 1: Check if listing is LIVE
-        $isLive = false;
-        $bitrixId = null;
-
-        $response = $httpClient->get("https://atlas.propertyfinder.com/v1/listings?" . http_build_query([
-            'filter' => ['ids' => $pfId]
-        ]));
-
-        if ($httpClient->getStatus() === 200) {
-            $decoded = json_decode($response, true);
-            if (!empty($decoded['results'][0])) {
-                $isLive = true;
-            }
-        }
-
-        // Step 2: Resolve Bitrix listing ID by reference
+        // -----------------------------------------------------------------
+        // Step 1: Find the listing using the PF listing ID
+        // -----------------------------------------------------------------
         $factory = \Bitrix\Crm\Service\Container::getInstance()->getFactory(static::$entityTypeId);
         if (!$factory) {
             throw new \Exception('Factory not found for listing entity');
         }
 
-        $items = $factory->getItems([
-            'select' => ['ID', 'UF_CRM_5_1752571265'],
-            'filter' => ['=UF_CRM_5_1752571265' => $reference],
-            'limit'  => 1,
-        ]);
+        $items = [];
+        $filterOr = [];
+        if ($pfId) {
+            $filterOr[] = ['=UF_CRM_5_1754838287' => $pfId];
+            $filterOr[] = ['=UF_CRM_5_1752571265' => $pfId];
+        }
+        if ($reference) {
+            $filterOr[] = ['=UF_CRM_5_1754838287' => $reference];
+            $filterOr[] = ['=UF_CRM_5_1752571265' => $reference];
+        }
+
+        if (!empty($filterOr)) {
+            $items = $factory->getItems([
+                'select' => ['ID', 'UF_CRM_5_1752571265', 'UF_CRM_5_1754838287'],
+                'filter' => count($filterOr) === 1 ? current($filterOr) : array_merge(['LOGIC' => 'OR'], $filterOr),
+                'limit'  => 1,
+            ]);
+        }
+
+        // If not found in Bitrix by direct field match, fetch the listing from PF to get its reference
+        if (empty($items) && $pfId) {
+            // Check draft first
+            $httpClient->get("https://atlas.propertyfinder.com/v1/listings?" . http_build_query([
+                'draft'  => 'true',
+                'filter' => ['ids' => $pfId]
+            ]));
+            $pfJson = ($httpClient->getStatus() === 200) ? json_decode($httpClient->getResult(), true) : null;
+            $pfRef = $pfJson['results'][0]['reference'] ?? null;
+
+            if (!$pfRef) {
+                // Check live
+                $httpClient->get("https://atlas.propertyfinder.com/v1/listings?" . http_build_query([
+                    'filter' => ['ids' => $pfId]
+                ]));
+                $pfJson = ($httpClient->getStatus() === 200) ? json_decode($httpClient->getResult(), true) : null;
+                $pfRef = $pfJson['results'][0]['reference'] ?? null;
+            }
+
+            if ($pfRef) {
+                $items = $factory->getItems([
+                    'select' => ['ID', 'UF_CRM_5_1752571265', 'UF_CRM_5_1754838287'],
+                    'filter' => ['=UF_CRM_5_1752571265' => $pfRef],
+                    'limit'  => 1,
+                ]);
+            }
+        }
 
         if (empty($items)) {
-            throw new \Exception("No Bitrix listing found for reference: {$reference}");
+            throw new \Exception("No Bitrix listing found for PF ID: '{$pfId}'" . ($reference ? " or reference: '{$reference}'" : ''));
         }
 
-        $bitrixId = current($items)->getId();
-
-        // Step 3: Unpublish if live
-        if ($isLive) {
-            $this->unpublishListing($pfId);
-        }
-
-        // Step 4: Update
-        $this->updateListing($pfId, $bitrixId);
-
-        // Step 5: Publish
-        $this->publishListing($pfId);
+        $bitrixItem = current($items);
+        $bitrixId   = $bitrixItem->getId();
 
         \Bitrix\Main\Diag\Debug::writeToFile(
-            ['pfId' => $pfId, 'reference' => $reference, 'wasLive' => $isLive],
+            ['bitrixId' => $bitrixId, 'pfId' => $pfId, 'reference' => $reference],
+            "PF Refresh Start " . date('Y-m-d H:i:s'),
+            $logFile
+        );
+
+        // -----------------------------------------------------------------
+        // Step 2: Delete the listing, no matter it is live or not
+        // -----------------------------------------------------------------
+        $this->deleteListing($pfId);
+
+        // Make sure the old listing is deleted (not returned in live or draft)
+        $isDeleted = false;
+        $maxRetries = 5;
+        $retryDelay = 2; // seconds
+
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            // Check live listings
+            $httpClient->get("https://atlas.propertyfinder.com/v1/listings?" . http_build_query([
+                'filter' => ['ids' => $pfId]
+            ]));
+            $foundInLive = false;
+            if ($httpClient->getStatus() === 200) {
+                $liveJson = json_decode($httpClient->getResult(), true);
+                if (!empty($liveJson['results'])) {
+                    foreach ($liveJson['results'] as $resItem) {
+                        if ((string)($resItem['id'] ?? '') === (string)$pfId) {
+                            $foundInLive = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Check draft listings
+            $httpClient->get("https://atlas.propertyfinder.com/v1/listings?" . http_build_query([
+                'draft'  => 'true',
+                'filter' => ['ids' => $pfId]
+            ]));
+            $foundInDraft = false;
+            if ($httpClient->getStatus() === 200) {
+                $draftJson = json_decode($httpClient->getResult(), true);
+                if (!empty($draftJson['results'])) {
+                    foreach ($draftJson['results'] as $resItem) {
+                        if ((string)($resItem['id'] ?? '') === (string)$pfId) {
+                            $foundInDraft = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!$foundInLive && !$foundInDraft) {
+                $isDeleted = true;
+                break;
+            }
+
+            sleep($retryDelay);
+        }
+
+        if (!$isDeleted) {
+            \Bitrix\Main\Diag\Debug::writeToFile(
+                ['pfId' => $pfId, 'status' => 'deletion_not_confirmed'],
+                "PF Refresh Delete Verification Failed " . date('Y-m-d H:i:s'),
+                $logFile
+            );
+            throw new \Exception("Failed to confirm deletion of old PF listing ID {$pfId}. Listing is still active or draft on Property Finder.");
+        }
+
+        \Bitrix\Main\Diag\Debug::writeToFile(
+            ['pfId' => $pfId, 'action' => 'confirm_delete', 'status' => 'confirmed'],
+            "PF Refresh Delete Confirmed " . date('Y-m-d H:i:s'),
+            $logFile
+        );
+
+        // -----------------------------------------------------------------
+        // Step 3: Create new listing and add the new PF ID to the SPA item field
+        // -----------------------------------------------------------------
+        $newPfId = $this->sendListingDraft($bitrixId);
+        if (!$newPfId) {
+            throw new \Exception("Failed to create new listing draft for Bitrix listing #{$bitrixId}");
+        }
+
+        // Add the new PF ID to the SPA item field (UF_CRM_5_1752571265 and UF_CRM_5_1754838287)
+        $itemToUpdate = $factory->getItem($bitrixId);
+        if ($itemToUpdate) {
+            $itemToUpdate->set('UF_CRM_5_1752571265', $newPfId);
+            $itemToUpdate->set('UF_CRM_5_1754838287', $newPfId);
+            $op = $factory->getUpdateOperation($itemToUpdate)
+                ->disableCheckFields()
+                ->disableBizProc()
+                ->disableCheckAccess();
+            $res = $op->launch();
+            if (!$res->isSuccess()) {
+                \Bitrix\Main\Diag\Debug::writeToFile(
+                    "Failed updating Bitrix #{$bitrixId} with new PFID {$newPfId}: " . implode('; ', $res->getErrorMessages()),
+                    "PF Refresh Warning " . date('Y-m-d H:i:s'),
+                    $logFile
+                );
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Step 4: Make it live and make sure the new listing is live / created
+        // -----------------------------------------------------------------
+        $this->publishListing($newPfId);
+
+        $isLiveConfirmed = false;
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            $httpClient->get("https://atlas.propertyfinder.com/v1/listings?" . http_build_query([
+                'filter' => ['ids' => $newPfId]
+            ]));
+
+            if ($httpClient->getStatus() === 200) {
+                $decoded = json_decode($httpClient->getResult(), true);
+                if (!empty($decoded['results'])) {
+                    foreach ($decoded['results'] as $resItem) {
+                        if ((string)($resItem['id'] ?? '') === (string)$newPfId) {
+                            $isLiveConfirmed = true;
+                            break 2;
+                        }
+                    }
+                }
+            }
+
+            sleep($retryDelay);
+        }
+
+        if (!$isLiveConfirmed) {
+            \Bitrix\Main\Diag\Debug::writeToFile(
+                ['newPfId' => $newPfId, 'action' => 'verify_live', 'status' => 'failed'],
+                "PF Refresh Verify Live FAILED " . date('Y-m-d H:i:s'),
+                $logFile
+            );
+            throw new \Exception("Listing {$newPfId} was published, but could not be confirmed as live on Property Finder.");
+        }
+
+        \Bitrix\Main\Diag\Debug::writeToFile(
+            [
+                'oldPfId'    => $pfId,
+                'newPfId'    => $newPfId,
+                'bitrixId'   => $bitrixId,
+                'status'     => 'success_recreated_and_live'
+            ],
             "PF Refresh SUCCESS " . date('Y-m-d H:i:s'),
-            "pfexport.log"
+            $logFile
         );
 
         return true;
