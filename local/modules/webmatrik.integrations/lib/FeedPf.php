@@ -12,6 +12,10 @@ use Bitrix\Main\Application;
 
 class FeedPf extends Feed
 {
+    public const UF_PF_LOCATION_ACTIVE = 'UF_CRM_9_1788936046';
+    public const LOCATION_ACTIVE = 1;
+    public const LOCATION_INACTIVE = 0;
+
     protected static $token;
     protected static $mask;
     protected static $offplan;
@@ -183,14 +187,15 @@ class FeedPf extends Feed
         return $result;
     }
 
-    private static function getPfLocations($city)
+    private static function getPfLocations($city, &$hasError = false)
     {
+        $logFile = 'pf_location_sync.log';
         $httpClient = self::getHttpClient();
         $url = 'https://atlas.propertyfinder.com/v1/locations'; // Adjust endpoint as needed
 
         $queryParams = [
             'search' => $city,
-            'page' => 1, // Example additional parameter,
+            'page' => 1,
             'perPage' => 100
         ];
 
@@ -203,23 +208,29 @@ class FeedPf extends Feed
         $status = $httpClient->getStatus();
 
         $pflocations = [];
+        $hasError = false;
 
         if ($status == 200) {
             $responseData = json_decode($response, true);
-            //print_r($responseData);
-            //self::processLocations($responseData['data'], $factory);
-            //return $responseData['accessToken'];
-            //echo '✅ Token: ' . $responseData['accessToken'];
-            $pages = $responseData['pagination']['totalPages'];
-            foreach ($responseData['data'] as $item) {
-                $pflocations[$item['id']] = $item['tree'];
+            if (!is_array($responseData) || !isset($responseData['data'])) {
+                $hasError = true;
+                \Bitrix\Main\Diag\Debug::writeToFile("❌ Failed to decode PF response or missing data for {$city} page 1", '', $logFile);
+                return $pflocations;
             }
-            $startpage = 2;
+
+            $pages = (int)($responseData['pagination']['totalPages'] ?? 1);
+            foreach ($responseData['data'] as $item) {
+                if (!empty($item['id'])) {
+                    $pflocations[$item['id']] = $item['tree'] ?? [];
+                }
+            }
+
             if ($pages > 1) {
+                $startpage = 2;
                 while ($startpage <= $pages) {
                     $queryParams = [
                         'search' => $city,
-                        'page' => $startpage, // Example additional parameter,
+                        'page' => $startpage,
                         'perPage' => 100
                     ];
                     $startpage++;
@@ -233,15 +244,27 @@ class FeedPf extends Feed
 
                     if ($status == 200) {
                         $responseData = json_decode($response, true);
-                        foreach ($responseData['data'] as $item) {
-                            $pflocations[$item['id']] = $item['tree'];
+                        if (is_array($responseData) && isset($responseData['data'])) {
+                            foreach ($responseData['data'] as $item) {
+                                if (!empty($item['id'])) {
+                                    $pflocations[$item['id']] = $item['tree'] ?? [];
+                                }
+                            }
+                        } else {
+                            $hasError = true;
+                            \Bitrix\Main\Diag\Debug::writeToFile("❌ JSON parse error for {$city} on page " . ($startpage - 1), '', $logFile);
+                            break;
                         }
+                    } else {
+                        $hasError = true;
+                        \Bitrix\Main\Diag\Debug::writeToFile("❌ HTTP Error: {$status} on page " . ($startpage - 1) . " for {$city}", '', $logFile);
+                        break;
                     }
                 }
             }
         } else {
-            echo "❌ HTTP Error: $status\n";
-            echo "Response Body: " . $response . "\n";
+            $hasError = true;
+            \Bitrix\Main\Diag\Debug::writeToFile("❌ HTTP Error: {$status} on page 1 for {$city}. Response: {$response}", '', $logFile);
         }
 
         return $pflocations;
@@ -361,11 +384,26 @@ class FeedPf extends Feed
         \Bitrix\Main\Diag\Debug::writeToFile('--- PF User Sync Completed --- ' . $timestamp, '', $logFile);
     }
 
-    public function syncLocations($city)
+    public function syncLocations($cities = null, bool $deactivateOutdated = true)
     {
         $logFile = 'pf_location_sync.log';
         $timestamp = date('Y-m-d H:i:s');
-        \Bitrix\Main\Diag\Debug::writeToFile("--- Sync started for city: {$city} --- {$timestamp}", '', $logFile);
+
+        $defaultCities = ['Dubai', 'Abu Dhabi', 'Sharjah', 'Ajman', 'Ras Al Khaimah', 'Fujairah', 'Umm Al Quwain'];
+        if ($cities === null) {
+            $cities = $defaultCities;
+            $isFullSync = true;
+        } elseif (is_string($cities)) {
+            $cities = [$cities];
+            $isFullSync = false;
+        } elseif (is_array($cities)) {
+            $isFullSync = empty(array_diff($defaultCities, $cities));
+        } else {
+            $cities = $defaultCities;
+            $isFullSync = true;
+        }
+
+        \Bitrix\Main\Diag\Debug::writeToFile("--- Sync started for cities: " . implode(', ', $cities) . " --- {$timestamp}", '', $logFile);
 
         $factory = \Bitrix\Crm\Service\Container::getInstance()->getFactory(static::$locentityTypeId);
 
@@ -377,7 +415,7 @@ class FeedPf extends Feed
         static $allCurLocations = null;
         if ($allCurLocations === null) {
             $params = [
-                'select' => ['ID', 'TITLE', 'UF_CRM_9_1753773914'],
+                'select' => ['ID', 'TITLE', 'UF_CRM_9_1753773914', static::UF_PF_LOCATION_ACTIVE],
                 'order'  => ['ID' => 'ASC'],
             ];
 
@@ -385,96 +423,300 @@ class FeedPf extends Feed
 
             $allCurLocations = [
                 'byPf' => [],
-                'byTitle' => []
+                'byTitle' => [],
+                'allItems' => []
             ];
 
             foreach ($items as $item) {
                 $data = $item->getData();
                 $titleNorm = mb_strtolower(trim(preg_replace('/\s+/', ' ', $data['TITLE'])));
-                if (!empty($data['UF_CRM_9_1753773914'])) {
-                    $allCurLocations['byPf'][$data['UF_CRM_9_1753773914']] = $data['ID'];
+                $pfId = $data['UF_CRM_9_1753773914'] ?? null;
+                $rawActive = $data[static::UF_PF_LOCATION_ACTIVE] ?? null;
+                $isYes = ($rawActive === 1 || $rawActive === '1' || $rawActive === true || $rawActive === 'Y');
+                $isNo = ($rawActive === 0 || $rawActive === '0' || $rawActive === false || $rawActive === 'N');
+
+                $locInfo = [
+                    'ID' => (int)$data['ID'],
+                    'TITLE' => $data['TITLE'],
+                    'PF_ID' => $pfId,
+                    'IS_ACTIVE' => $isYes ? static::LOCATION_ACTIVE : static::LOCATION_INACTIVE,
+                    'IS_YES' => $isYes,
+                    'IS_NO' => $isNo,
+                ];
+
+                if (!empty($pfId)) {
+                    $allCurLocations['byPf'][$pfId] = $locInfo;
                 }
-                $allCurLocations['byTitle'][$titleNorm] = $data['ID'];
+                $allCurLocations['allItems'][$data['ID']] = $locInfo;
+                $allCurLocations['byTitle'][$titleNorm] = $locInfo;
             }
 
             \Bitrix\Main\Diag\Debug::writeToFile('Cached existing locations: ' . count($allCurLocations['byTitle']), '', $logFile);
         }
 
-        // Fetch locations from Property Finder
-        $pfLocations = static::getPfLocations($city);
-        if (empty($pfLocations)) {
-            \Bitrix\Main\Diag\Debug::writeToFile("No PF locations found for {$city}", '', $logFile);
-            return;
+        $validPfIds = [];
+        $hadFetchErrors = false;
+
+        foreach ($cities as $city) {
+            $cityTimestamp = date('Y-m-d H:i:s');
+            \Bitrix\Main\Diag\Debug::writeToFile("--- Syncing city: {$city} --- {$cityTimestamp}", '', $logFile);
+
+            // Fetch locations from Property Finder
+            $cityHasError = false;
+            $pfLocations = static::getPfLocations($city, $cityHasError);
+
+            if ($cityHasError) {
+                $hadFetchErrors = true;
+                \Bitrix\Main\Diag\Debug::writeToFile("Fetch error occurred for {$city}. Outdated deactivation will be skipped for safety.", '', $logFile);
+            }
+
+            if (empty($pfLocations)) {
+                \Bitrix\Main\Diag\Debug::writeToFile("No PF locations found for {$city}", '', $logFile);
+                continue;
+            }
+
+            foreach ($pfLocations as $pfId => $tree) {
+                $validPfIds[$pfId] = true;
+
+                // 1. If PF ID already exists in Bitrix
+                if (isset($allCurLocations['byPf'][$pfId])) {
+                    $existingLoc = $allCurLocations['byPf'][$pfId];
+
+                    // Reactivate if not already explicitly Yes
+                    if (!$existingLoc['IS_YES']) {
+                        $existingItem = $factory->getItem($existingLoc['ID']);
+                        if ($existingItem) {
+                            $existingItem->set(static::UF_PF_LOCATION_ACTIVE, static::LOCATION_ACTIVE);
+                            $updateOp = $factory->getUpdateOperation($existingItem)
+                                ->disableCheckFields()
+                                ->disableBizProc()
+                                ->disableCheckAccess();
+                            $updateRes = $updateOp->launch();
+
+                            if ($updateRes->isSuccess()) {
+                                \Bitrix\Main\Diag\Debug::writeToFile("Set location '{$existingLoc['TITLE']}' (ID: {$existingLoc['ID']}, PFID: {$pfId}) to Yes (ACTIVE)", '', $logFile);
+                                $allCurLocations['byPf'][$pfId]['IS_ACTIVE'] = static::LOCATION_ACTIVE;
+                                $allCurLocations['byPf'][$pfId]['IS_YES'] = true;
+                                $allCurLocations['byPf'][$pfId]['IS_NO'] = false;
+                                if (isset($allCurLocations['allItems'][$existingLoc['ID']])) {
+                                    $allCurLocations['allItems'][$existingLoc['ID']]['IS_ACTIVE'] = static::LOCATION_ACTIVE;
+                                    $allCurLocations['allItems'][$existingLoc['ID']]['IS_YES'] = true;
+                                    $allCurLocations['allItems'][$existingLoc['ID']]['IS_NO'] = false;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Build and normalize title
+                $reversedTree = array_reverse($tree, true);
+                $titles = [];
+                foreach ($reversedTree as $locPart) {
+                    $titles[] = $locPart['name'];
+                }
+
+                $title = implode(', ', $titles);
+                $titleNorm = mb_strtolower(trim(preg_replace('/\s+/', ' ', $title)));
+
+                // 2. Check if location with same title already exists
+                if (isset($allCurLocations['byTitle'][$titleNorm])) {
+                    $existingLoc = $allCurLocations['byTitle'][$titleNorm];
+                    $existingId = $existingLoc['ID'];
+                    $existingItem = $factory->getItem($existingId);
+
+                    if ($existingItem) {
+                        $existingItem->set('UF_CRM_9_1753773914', $pfId);
+                        $existingItem->set(static::UF_PF_LOCATION_ACTIVE, static::LOCATION_ACTIVE);
+                        $updateOp = $factory->getUpdateOperation($existingItem)
+                            ->disableCheckFields()
+                            ->disableBizProc()
+                            ->disableCheckAccess();
+                        $updateRes = $updateOp->launch();
+
+                        if ($updateRes->isSuccess()) {
+                            \Bitrix\Main\Diag\Debug::writeToFile("Updated existing location '{$title}' (ID: {$existingId}) with PFID: {$pfId} (Yes)", '', $logFile);
+                            $locInfo = [
+                                'ID' => $existingId,
+                                'TITLE' => $title,
+                                'PF_ID' => $pfId,
+                                'IS_ACTIVE' => static::LOCATION_ACTIVE,
+                                'IS_YES' => true,
+                                'IS_NO' => false,
+                            ];
+                            $allCurLocations['byPf'][$pfId] = $locInfo;
+                            $allCurLocations['allItems'][$existingId] = $locInfo;
+                            $allCurLocations['byTitle'][$titleNorm] = $locInfo;
+                        } else {
+                            $errors = implode('; ', $updateRes->getErrorMessages());
+                            \Bitrix\Main\Diag\Debug::writeToFile("Failed to update location '{$title}': {$errors}", '', $logFile);
+                        }
+                    }
+                    continue;
+                }
+
+                // 3. Create new location if not found by PF ID or Title
+                $newItem = $factory->createItem([
+                    'TITLE' => $title,
+                    'ASSIGNED_BY_ID' => 1013,
+                    'UF_CRM_9_1753773914' => $pfId,
+                    static::UF_PF_LOCATION_ACTIVE => static::LOCATION_ACTIVE,
+                ]);
+
+                $operation = $factory->getAddOperation($newItem)
+                    ->disableCheckFields()
+                    ->disableBizProc()
+                    ->disableCheckAccess();
+
+                $addResult = $operation->launch();
+
+                if ($addResult->isSuccess()) {
+                    $newId = $newItem->getId();
+                    \Bitrix\Main\Diag\Debug::writeToFile("Added new location '{$title}' (ID: {$newId}, PFID: {$pfId}, Yes)", '', $logFile);
+
+                    $locInfo = [
+                        'ID' => $newId,
+                        'TITLE' => $title,
+                        'PF_ID' => $pfId,
+                        'IS_ACTIVE' => static::LOCATION_ACTIVE,
+                        'IS_YES' => true,
+                        'IS_NO' => false,
+                    ];
+                    $allCurLocations['byPf'][$pfId] = $locInfo;
+                    $allCurLocations['allItems'][$newId] = $locInfo;
+                    $allCurLocations['byTitle'][$titleNorm] = $locInfo;
+                } else {
+                    $errors = implode('; ', $addResult->getErrorMessages());
+                    \Bitrix\Main\Diag\Debug::writeToFile("Failed to add location '{$title}': {$errors}", '', $logFile);
+                }
+            }
+
+            \Bitrix\Main\Diag\Debug::writeToFile("--- City completed: {$city} ---", '', $logFile);
         }
 
-        foreach ($pfLocations as $pfId => $tree) {
-            // Skip if PF ID already exists in Bitrix
-            if (isset($allCurLocations['byPf'][$pfId])) {
-                continue;
-            }
+        // --- Set Outdated / Inactive Locations to No ---
+        if ($deactivateOutdated && !$hadFetchErrors && !empty($validPfIds)) {
+            \Bitrix\Main\Diag\Debug::writeToFile("Checking for outdated/inactive locations against " . count($validPfIds) . " valid PF IDs...", '', $logFile);
 
-            // Build and normalize title
-            $reversedTree = array_reverse($tree, true);
-            $titles = [];
-            foreach ($reversedTree as $locPart) {
-                $titles[] = $locPart['name'];
-            }
+            $deactivatedCount = 0;
 
-            $title = implode(', ', $titles);
-            $titleNorm = mb_strtolower(trim(preg_replace('/\s+/', ' ', $title)));
+            foreach ($allCurLocations['allItems'] as $locId => $locData) {
+                $pfId = $locData['PF_ID'];
 
-            // Check if location with same title already exists
-            if (isset($allCurLocations['byTitle'][$titleNorm])) {
-                $existingId = $allCurLocations['byTitle'][$titleNorm];
-                $existingItem = $factory->getItem($existingId);
+                // If this location's PF ID is valid in PF, skip (it is active)
+                if (!empty($pfId) && isset($validPfIds[$pfId])) {
+                    continue;
+                }
 
-                if ($existingItem) {
-                    $existingItem->set('UF_CRM_9_1753773914', $pfId);
-                    $updateOp = $factory->getUpdateOperation($existingItem)
-                        ->disableCheckFields()
-                        ->disableBizProc()
-                        ->disableCheckAccess();
-                    $updateRes = $updateOp->launch();
-
-                    if ($updateRes->isSuccess()) {
-                        \Bitrix\Main\Diag\Debug::writeToFile("Updated existing location '{$title}' (ID: {$existingId}) with PFID: {$pfId}", '', $logFile);
-                        $allCurLocations['byPf'][$pfId] = $existingId; // update cache
-                    } else {
-                        $errors = implode('; ', $updateRes->getErrorMessages());
-                        \Bitrix\Main\Diag\Debug::writeToFile("Failed to update location '{$title}': {$errors}", '', $logFile);
+                // If not a full sync, only deactivate locations belonging to the synced cities
+                if (!$isFullSync) {
+                    $belongsToSyncedCity = false;
+                    foreach ($cities as $city) {
+                        if (stripos($locData['TITLE'], $city) !== false) {
+                            $belongsToSyncedCity = true;
+                            break;
+                        }
+                    }
+                    if (!$belongsToSyncedCity) {
+                        continue;
                     }
                 }
+
+                // If NOT already set to No (i.e. currently Yes or null/empty), set to No (0)
+                if (!$locData['IS_NO']) {
+                    $item = $factory->getItem($locId);
+                    if ($item) {
+                        $item->set(static::UF_PF_LOCATION_ACTIVE, static::LOCATION_INACTIVE);
+                        $updateOp = $factory->getUpdateOperation($item)
+                            ->disableCheckFields()
+                            ->disableBizProc()
+                            ->disableCheckAccess();
+                        $updateRes = $updateOp->launch();
+
+                        if ($updateRes->isSuccess()) {
+                            $deactivatedCount++;
+                            \Bitrix\Main\Diag\Debug::writeToFile("Set location '{$locData['TITLE']}' (ID: {$locId}, PFID: " . ($pfId ?: 'NONE') . ") to No (INACTIVE)", '', $logFile);
+                            $allCurLocations['allItems'][$locId]['IS_ACTIVE'] = static::LOCATION_INACTIVE;
+                            $allCurLocations['allItems'][$locId]['IS_YES'] = false;
+                            $allCurLocations['allItems'][$locId]['IS_NO'] = true;
+                            if (!empty($pfId) && isset($allCurLocations['byPf'][$pfId])) {
+                                $allCurLocations['byPf'][$pfId]['IS_ACTIVE'] = static::LOCATION_INACTIVE;
+                                $allCurLocations['byPf'][$pfId]['IS_YES'] = false;
+                                $allCurLocations['byPf'][$pfId]['IS_NO'] = true;
+                            }
+                        } else {
+                            $errors = implode('; ', $updateRes->getErrorMessages());
+                            \Bitrix\Main\Diag\Debug::writeToFile("Failed to mark location '{$locData['TITLE']}' (ID: {$locId}) as No: {$errors}", '', $logFile);
+                        }
+                    }
+                }
+            }
+
+            \Bitrix\Main\Diag\Debug::writeToFile("Outdated locations check completed. Set {$deactivatedCount} locations to No (Inactive).", '', $logFile);
+        }
+
+        $endTimestamp = date('Y-m-d H:i:s');
+        \Bitrix\Main\Diag\Debug::writeToFile("--- PF Location Sync finished --- {$endTimestamp}", '', $logFile);
+    }
+
+    /**
+     * One-time or bulk utility to set all currently unassigned or inactive locations in Bitrix SPA to No (0).
+     *
+     * @return int Number of updated locations
+     */
+    public static function setAllInactiveLocationsToNo()
+    {
+        $logFile = 'pf_location_sync.log';
+        $timestamp = date('Y-m-d H:i:s');
+        \Bitrix\Main\Diag\Debug::writeToFile("--- Bulk setting inactive locations to No started --- {$timestamp}", '', $logFile);
+
+        $factory = \Bitrix\Crm\Service\Container::getInstance()->getFactory(static::$locentityTypeId);
+        if (!$factory) {
+            throw new \Exception('Factory not found for entity type ID: ' . static::$locentityTypeId);
+        }
+
+        $params = [
+            'select' => ['ID', 'TITLE', 'UF_CRM_9_1753773914', static::UF_PF_LOCATION_ACTIVE],
+            'order'  => ['ID' => 'ASC'],
+        ];
+
+        $items = $factory->getItems($params);
+        $updatedCount = 0;
+
+        foreach ($items as $item) {
+            $data = $item->getData();
+            $val = $data[static::UF_PF_LOCATION_ACTIVE] ?? null;
+
+            // If already Yes, skip
+            if ($val === 1 || $val === '1' || $val === true || $val === 'Y') {
                 continue;
             }
 
-            // Create new location if not found by PF ID or Title
-            $newItem = $factory->createItem([
-                'TITLE' => $title,
-                'ASSIGNED_BY_ID' => 1013,
-                'UF_CRM_9_1753773914' => $pfId
-            ]);
+            // If already No, skip
+            if ($val === 0 || $val === '0' || $val === false || $val === 'N') {
+                continue;
+            }
 
-            $operation = $factory->getAddOperation($newItem)
+            // Otherwise (null or empty), set to No (0)
+            $item->set(static::UF_PF_LOCATION_ACTIVE, static::LOCATION_INACTIVE);
+            $updateOp = $factory->getUpdateOperation($item)
                 ->disableCheckFields()
                 ->disableBizProc()
                 ->disableCheckAccess();
+            $updateRes = $updateOp->launch();
 
-            $addResult = $operation->launch();
-
-            if ($addResult->isSuccess()) {
-                $newId = $newItem->getId();
-                \Bitrix\Main\Diag\Debug::writeToFile("Added new location '{$title}' (ID: {$newId}, PFID: {$pfId})", '', $logFile);
-
-                // Update cache
-                $allCurLocations['byPf'][$pfId] = $newId;
-                $allCurLocations['byTitle'][$titleNorm] = $newId;
+            if ($updateRes->isSuccess()) {
+                $updatedCount++;
+                \Bitrix\Main\Diag\Debug::writeToFile("Set location '{$data['TITLE']}' (ID: {$data['ID']}) to No (Inactive)", '', $logFile);
             } else {
-                $errors = implode('; ', $addResult->getErrorMessages());
-                \Bitrix\Main\Diag\Debug::writeToFile("Failed to add location '{$title}': {$errors}", '', $logFile);
+                $errors = implode('; ', $updateRes->getErrorMessages());
+                \Bitrix\Main\Diag\Debug::writeToFile("Failed to set location '{$data['TITLE']}' (ID: {$data['ID']}) to No: {$errors}", '', $logFile);
             }
         }
 
-        \Bitrix\Main\Diag\Debug::writeToFile("--- Sync completed for city: {$city} --- {$timestamp}", '', $logFile);
+        \Bitrix\Main\Diag\Debug::writeToFile("Bulk setting inactive locations to No completed. Total updated: {$updatedCount}", '', $logFile);
+
+        return $updatedCount;
     }
 
     private static function processLocations($data, $factory)
