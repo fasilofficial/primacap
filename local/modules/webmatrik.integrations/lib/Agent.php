@@ -24,6 +24,14 @@ class Agent
         return '\\' . __METHOD__ . '();';
     }
 
+    public static function syncBayutLocations()
+    {
+        $obj = new FeedBayut();
+        $obj->syncLocations();
+
+        return '\\' . __METHOD__ . '();';
+    }
+
     public static function syncPfLocations()
     {
         $obj = new FeedPf();

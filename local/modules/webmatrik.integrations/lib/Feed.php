@@ -181,53 +181,92 @@ abstract class Feed
             // get locations
             $locations = array_unique($locations);
 
-            $params = [
-                'select' => ['ID', 'TITLE', 'UF_CRM_9_1753773914'],
-                'filter' => [
-                    '@ID' => $locations
-                ],
-                'order' => ['ID' => 'ASC'],
-            ];
-
             $locobj = null;
             if ($mode == 'bayut') {
-                // remove UF_CRM_9_1753773914 from select for bayut
-                unset($params['select'][2]);
+                $params = [
+                    'select' => [
+                        'ID',
+                        'TITLE',
+                        FeedBayut::UF_BAYUT_LOCATION_ID,
+                        FeedBayut::UF_BAYUT_LOCATION_COORDINATES
+                    ],
+                    'filter' => [
+                        '@ID' => $locations
+                    ],
+                    'order' => ['ID' => 'ASC'],
+                ];
                 $locobj = $bayutLocFactory->getItems($params);
             } elseif ($mode == 'Pf') {
+                $params = [
+                    'select' => [
+                        'ID',
+                        'TITLE',
+                        FeedPf::UF_PF_LOCATION_ID,
+                        FeedPf::UF_PF_LOCATION_COORDINATES
+                    ],
+                    'filter' => [
+                        '@ID' => $locations
+                    ],
+                    'order' => ['ID' => 'ASC'],
+                ];
                 $locobj = $rellocfactory->getItems($params);
             }
 
             $locresult = [];
 
-            foreach ($locobj as $item) {
-                $data = $item->getData();
-                if ($mode == 'bayut') {
-                    $titles = array_reverse(array_map('trim', explode(',', $data['TITLE'])));
-                    $count = count($titles);
+            if ($locobj) {
+                foreach ($locobj as $item) {
+                    $data = $item->getData();
+                    $latitude = '';
+                    $longitude = '';
 
-                    $city = $titles[0] ?? '';
-                    $locality = $titles[1] ?? '';
-                    $subLocality = '';
-                    $tower = '';
+                    if ($mode == 'bayut') {
+                        $geoStr = (string)($data[FeedBayut::UF_BAYUT_LOCATION_COORDINATES] ?? '');
+                        if (!empty($geoStr) && strpos($geoStr, ',') !== false) {
+                            $geoParts = explode(',', $geoStr);
+                            $latitude = trim($geoParts[0] ?? '');
+                            $longitude = trim($geoParts[1] ?? '');
+                        }
 
-                    if ($count === 3) {
-                        // 3 parts: city, locality, tower
-                        $tower = $titles[2];
-                    } elseif ($count >= 4) {
-                        // 4 or more parts: city, locality, sub-locality, tower
-                        $subLocality = $titles[2];
-                        $tower = $titles[3];
+                        $titles = array_reverse(array_map('trim', explode(',', $data['TITLE'])));
+                        $count = count($titles);
+
+                        $city = $titles[0] ?? '';
+                        $locality = $titles[1] ?? '';
+                        $subLocality = '';
+                        $tower = '';
+
+                        if ($count === 3) {
+                            // 3 parts: city, locality, tower
+                            $tower = $titles[2];
+                        } elseif ($count >= 4) {
+                            // 4 or more parts: city, locality, sub-locality, tower
+                            $subLocality = $titles[2];
+                            $tower = $titles[3];
+                        }
+
+                        $locresult[$data['ID']] = [
+                            'City' => $city,
+                            'Locality' => $locality,
+                            'Sub_Locality' => $subLocality,
+                            'Tower_Name' => $tower,
+                            'Latitude' => $latitude,
+                            'Longitude' => $longitude,
+                        ];
+                    } elseif ($mode == 'Pf') {
+                        $geoStr = (string)($data[FeedPf::UF_PF_LOCATION_COORDINATES] ?? '');
+                        if (!empty($geoStr) && strpos($geoStr, ',') !== false) {
+                            $geoParts = explode(',', $geoStr);
+                            $latitude = trim($geoParts[0] ?? '');
+                            $longitude = trim($geoParts[1] ?? '');
+                        }
+
+                        $locresult[$data['ID']] = [
+                            'id' => (int)($data[FeedPf::UF_PF_LOCATION_ID] ?? 0),
+                            'Latitude' => $latitude,
+                            'Longitude' => $longitude,
+                        ];
                     }
-
-                    $locresult[$data['ID']] = [
-                        'City' => $city,
-                        'Locality' => $locality,
-                        'Sub_Locality' => $subLocality,
-                        'Tower_Name' => $tower
-                    ];
-                } elseif ($mode == 'Pf') {
-                    $locresult[$data['ID']] = (int)$data['UF_CRM_9_1753773914'];
                 }
             }
 
@@ -383,19 +422,32 @@ abstract class Feed
             //print_r($result);
 
             foreach ($result as $key => &$item) {
-                $item['location'] = $locresult[$item['location']];
-                $item['assignedTo'] = $userresult[$item['assignedTo']];
+                $locInfo = $locresult[$item['location']] ?? null;
                 if ($mode == 'bayut') {
-                    //$item['Photos'] = $photoresult[$key];
-                    //$item['Videos'] = $videoresult[$key];                    
+                    $item['location'] = $locInfo;
+                    if (is_array($locInfo)) {
+                        if (!empty($locInfo['Latitude'])) {
+                            $item['Latitude'] = $locInfo['Latitude'];
+                        }
+                        if (!empty($locInfo['Longitude'])) {
+                            $item['Longitude'] = $locInfo['Longitude'];
+                        }
+                    }
                 } elseif ($mode == 'Pf') {
-                    $item['createdBy'] = $userresult[$item['createdBy']];
-                    //$item['media']['images'] = $photoresult[$key];
-                    //if($videoresult[$key]) {
-                    //$item['media']['videos'] = $videoresult[$key];
-                    //}
-
+                    if (is_array($locInfo)) {
+                        $item['location'] = (int)($locInfo['id'] ?? 0);
+                        if (!empty($locInfo['Latitude'])) {
+                            $item['Latitude'] = $locInfo['Latitude'];
+                        }
+                        if (!empty($locInfo['Longitude'])) {
+                            $item['Longitude'] = $locInfo['Longitude'];
+                        }
+                    } else {
+                        $item['location'] = (int)$locInfo;
+                    }
+                    $item['createdBy'] = $userresult[$item['createdBy']] ?? null;
                 }
+                $item['assignedTo'] = $userresult[$item['assignedTo']] ?? null;
             }
         }
 

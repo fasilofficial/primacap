@@ -12,6 +12,8 @@ use Bitrix\Main\Application;
 
 class FeedPf extends Feed
 {
+    public const UF_PF_LOCATION_ID = 'UF_CRM_9_1753773914';
+    public const UF_PF_LOCATION_COORDINATES = 'UF_CRM_9_1794228612';
     public const UF_PF_LOCATION_ACTIVE = 'UF_CRM_9_1788936046';
     public const LOCATION_ACTIVE = 1;
     public const LOCATION_INACTIVE = 0;
@@ -147,7 +149,7 @@ class FeedPf extends Feed
     private static function getCurLocations($factory, $city)
     {
         $params = [
-            'select' => ['ID', 'TITLE', 'UF_CRM_9_1753773914'],
+            'select' => ['ID', 'TITLE', static::UF_PF_LOCATION_ID],
             'filter' => [
                 '%TITLE' => $city
             ],
@@ -160,7 +162,7 @@ class FeedPf extends Feed
 
         foreach ($items as $item) {
             $data = $item->getData();
-            $result[$data['UF_CRM_9_1753773914']][] = $data['ID'];
+            $result[$data[static::UF_PF_LOCATION_ID]][] = $data['ID'];
         }
 
         return $result;
@@ -169,7 +171,7 @@ class FeedPf extends Feed
     private static function getAllCurLocations($factory)
     {
         $params = [
-            'select' => ['ID', 'TITLE', 'UF_CRM_9_1753773914'],
+            'select' => ['ID', 'TITLE', static::UF_PF_LOCATION_ID],
             'order' => ['ID' => 'ASC'],
         ];
 
@@ -178,7 +180,7 @@ class FeedPf extends Feed
         $result = [];
         foreach ($items as $item) {
             $data = $item->getData();
-            $pfId = $data['UF_CRM_9_1753773914'];
+            $pfId = $data[static::UF_PF_LOCATION_ID];
             if ($pfId) {
                 $result[$pfId][] = $data['ID'];
             }
@@ -221,7 +223,10 @@ class FeedPf extends Feed
             $pages = (int)($responseData['pagination']['totalPages'] ?? 1);
             foreach ($responseData['data'] as $item) {
                 if (!empty($item['id'])) {
-                    $pflocations[$item['id']] = $item['tree'] ?? [];
+                    $pflocations[$item['id']] = [
+                        'tree'        => $item['tree'] ?? [],
+                        'coordinates' => $item['coordinates'] ?? null,
+                    ];
                 }
             }
 
@@ -247,7 +252,10 @@ class FeedPf extends Feed
                         if (is_array($responseData) && isset($responseData['data'])) {
                             foreach ($responseData['data'] as $item) {
                                 if (!empty($item['id'])) {
-                                    $pflocations[$item['id']] = $item['tree'] ?? [];
+                                    $pflocations[$item['id']] = [
+                                        'tree'        => $item['tree'] ?? [],
+                                        'coordinates' => $item['coordinates'] ?? null,
+                                    ];
                                 }
                             }
                         } else {
@@ -415,7 +423,7 @@ class FeedPf extends Feed
         static $allCurLocations = null;
         if ($allCurLocations === null) {
             $params = [
-                'select' => ['ID', 'TITLE', 'UF_CRM_9_1753773914', static::UF_PF_LOCATION_ACTIVE],
+                'select' => ['ID', 'TITLE', static::UF_PF_LOCATION_ID, static::UF_PF_LOCATION_COORDINATES, static::UF_PF_LOCATION_ACTIVE],
                 'order'  => ['ID' => 'ASC'],
             ];
 
@@ -430,8 +438,9 @@ class FeedPf extends Feed
             foreach ($items as $item) {
                 $data = $item->getData();
                 $titleNorm = mb_strtolower(trim(preg_replace('/\s+/', ' ', $data['TITLE'])));
-                $pfId = $data['UF_CRM_9_1753773914'] ?? null;
+                $pfId = $data[static::UF_PF_LOCATION_ID] ?? null;
                 $rawActive = $data[static::UF_PF_LOCATION_ACTIVE] ?? null;
+                $geo = $data[static::UF_PF_LOCATION_COORDINATES] ?? '';
                 $isYes = ($rawActive === 1 || $rawActive === '1' || $rawActive === true || $rawActive === 'Y');
                 $isNo = ($rawActive === 0 || $rawActive === '0' || $rawActive === false || $rawActive === 'N');
 
@@ -439,6 +448,7 @@ class FeedPf extends Feed
                     'ID' => (int)$data['ID'],
                     'TITLE' => $data['TITLE'],
                     'PF_ID' => $pfId,
+                    'GEO' => $geo,
                     'IS_ACTIVE' => $isYes ? static::LOCATION_ACTIVE : static::LOCATION_INACTIVE,
                     'IS_YES' => $isYes,
                     'IS_NO' => $isNo,
@@ -475,18 +485,35 @@ class FeedPf extends Feed
                 continue;
             }
 
-            foreach ($pfLocations as $pfId => $tree) {
+            foreach ($pfLocations as $pfId => $locPayload) {
                 $validPfIds[$pfId] = true;
+                $tree = is_array($locPayload) && isset($locPayload['tree']) ? $locPayload['tree'] : (is_array($locPayload) ? $locPayload : []);
+                $coordinates = is_array($locPayload) && isset($locPayload['coordinates']) ? $locPayload['coordinates'] : null;
+
+                $geoPoint = '';
+                if (!empty($coordinates)) {
+                    $lat = $coordinates['lat'] ?? $coordinates['latitude'] ?? null;
+                    $lng = $coordinates['lng'] ?? $coordinates['longitude'] ?? null;
+                    if ($lat !== null && $lng !== null && $lat !== '' && $lng !== '') {
+                        $geoPoint = $lat . ',' . $lng;
+                    }
+                }
 
                 // 1. If PF ID already exists in Bitrix
                 if (isset($allCurLocations['byPf'][$pfId])) {
                     $existingLoc = $allCurLocations['byPf'][$pfId];
+                    $needsReactivate = !$existingLoc['IS_YES'];
+                    $needsGeoUpdate = ($geoPoint && ($existingLoc['GEO'] ?? '') !== $geoPoint);
 
-                    // Reactivate if not already explicitly Yes
-                    if (!$existingLoc['IS_YES']) {
+                    if ($needsReactivate || $needsGeoUpdate) {
                         $existingItem = $factory->getItem($existingLoc['ID']);
                         if ($existingItem) {
-                            $existingItem->set(static::UF_PF_LOCATION_ACTIVE, static::LOCATION_ACTIVE);
+                            if ($needsReactivate) {
+                                $existingItem->set(static::UF_PF_LOCATION_ACTIVE, static::LOCATION_ACTIVE);
+                            }
+                            if ($needsGeoUpdate) {
+                                $existingItem->set(static::UF_PF_LOCATION_COORDINATES, $geoPoint);
+                            }
                             $updateOp = $factory->getUpdateOperation($existingItem)
                                 ->disableCheckFields()
                                 ->disableBizProc()
@@ -494,15 +521,27 @@ class FeedPf extends Feed
                             $updateRes = $updateOp->launch();
 
                             if ($updateRes->isSuccess()) {
-                                \Bitrix\Main\Diag\Debug::writeToFile("Set location '{$existingLoc['TITLE']}' (ID: {$existingLoc['ID']}, PFID: {$pfId}) to Yes (ACTIVE)", '', $logFile);
-                                $allCurLocations['byPf'][$pfId]['IS_ACTIVE'] = static::LOCATION_ACTIVE;
-                                $allCurLocations['byPf'][$pfId]['IS_YES'] = true;
-                                $allCurLocations['byPf'][$pfId]['IS_NO'] = false;
-                                if (isset($allCurLocations['allItems'][$existingLoc['ID']])) {
-                                    $allCurLocations['allItems'][$existingLoc['ID']]['IS_ACTIVE'] = static::LOCATION_ACTIVE;
-                                    $allCurLocations['allItems'][$existingLoc['ID']]['IS_YES'] = true;
-                                    $allCurLocations['allItems'][$existingLoc['ID']]['IS_NO'] = false;
+                                if ($needsReactivate) {
+                                    \Bitrix\Main\Diag\Debug::writeToFile("Set location '{$existingLoc['TITLE']}' (ID: {$existingLoc['ID']}, PFID: {$pfId}) to Yes (ACTIVE)", '', $logFile);
+                                    $allCurLocations['byPf'][$pfId]['IS_ACTIVE'] = static::LOCATION_ACTIVE;
+                                    $allCurLocations['byPf'][$pfId]['IS_YES'] = true;
+                                    $allCurLocations['byPf'][$pfId]['IS_NO'] = false;
+                                    if (isset($allCurLocations['allItems'][$existingLoc['ID']])) {
+                                        $allCurLocations['allItems'][$existingLoc['ID']]['IS_ACTIVE'] = static::LOCATION_ACTIVE;
+                                        $allCurLocations['allItems'][$existingLoc['ID']]['IS_YES'] = true;
+                                        $allCurLocations['allItems'][$existingLoc['ID']]['IS_NO'] = false;
+                                    }
                                 }
+                                if ($needsGeoUpdate) {
+                                    \Bitrix\Main\Diag\Debug::writeToFile("Updated location '{$existingLoc['TITLE']}' (ID: {$existingLoc['ID']}, PFID: {$pfId}) coordinates to {$geoPoint}", '', $logFile);
+                                    $allCurLocations['byPf'][$pfId]['GEO'] = $geoPoint;
+                                    if (isset($allCurLocations['allItems'][$existingLoc['ID']])) {
+                                        $allCurLocations['allItems'][$existingLoc['ID']]['GEO'] = $geoPoint;
+                                    }
+                                }
+                            } else {
+                                $errors = implode('; ', $updateRes->getErrorMessages());
+                                \Bitrix\Main\Diag\Debug::writeToFile("Failed to update location '{$existingLoc['TITLE']}' (ID: {$existingLoc['ID']}): {$errors}", '', $logFile);
                             }
                         }
                     }
@@ -526,8 +565,11 @@ class FeedPf extends Feed
                     $existingItem = $factory->getItem($existingId);
 
                     if ($existingItem) {
-                        $existingItem->set('UF_CRM_9_1753773914', $pfId);
+                        $existingItem->set(static::UF_PF_LOCATION_ID, $pfId);
                         $existingItem->set(static::UF_PF_LOCATION_ACTIVE, static::LOCATION_ACTIVE);
+                        if ($geoPoint) {
+                            $existingItem->set(static::UF_PF_LOCATION_COORDINATES, $geoPoint);
+                        }
                         $updateOp = $factory->getUpdateOperation($existingItem)
                             ->disableCheckFields()
                             ->disableBizProc()
@@ -535,11 +577,12 @@ class FeedPf extends Feed
                         $updateRes = $updateOp->launch();
 
                         if ($updateRes->isSuccess()) {
-                            \Bitrix\Main\Diag\Debug::writeToFile("Updated existing location '{$title}' (ID: {$existingId}) with PFID: {$pfId} (Yes)", '', $logFile);
+                            \Bitrix\Main\Diag\Debug::writeToFile("Updated existing location '{$title}' (ID: {$existingId}) with PFID: {$pfId} (Yes)" . ($geoPoint ? " and coordinates: {$geoPoint}" : ""), '', $logFile);
                             $locInfo = [
                                 'ID' => $existingId,
                                 'TITLE' => $title,
                                 'PF_ID' => $pfId,
+                                'GEO' => $geoPoint ?: ($existingLoc['GEO'] ?? ''),
                                 'IS_ACTIVE' => static::LOCATION_ACTIVE,
                                 'IS_YES' => true,
                                 'IS_NO' => false,
@@ -559,7 +602,8 @@ class FeedPf extends Feed
                 $newItem = $factory->createItem([
                     'TITLE' => $title,
                     'ASSIGNED_BY_ID' => 1013,
-                    'UF_CRM_9_1753773914' => $pfId,
+                    static::UF_PF_LOCATION_ID => $pfId,
+                    static::UF_PF_LOCATION_COORDINATES => $geoPoint ?: '',
                     static::UF_PF_LOCATION_ACTIVE => static::LOCATION_ACTIVE,
                 ]);
 
@@ -572,12 +616,13 @@ class FeedPf extends Feed
 
                 if ($addResult->isSuccess()) {
                     $newId = $newItem->getId();
-                    \Bitrix\Main\Diag\Debug::writeToFile("Added new location '{$title}' (ID: {$newId}, PFID: {$pfId}, Yes)", '', $logFile);
+                    \Bitrix\Main\Diag\Debug::writeToFile("Added new location '{$title}' (ID: {$newId}, PFID: {$pfId}, GEO: {$geoPoint}, Yes)", '', $logFile);
 
                     $locInfo = [
                         'ID' => $newId,
                         'TITLE' => $title,
                         'PF_ID' => $pfId,
+                        'GEO' => $geoPoint ?: '',
                         'IS_ACTIVE' => static::LOCATION_ACTIVE,
                         'IS_YES' => true,
                         'IS_NO' => false,
@@ -676,7 +721,7 @@ class FeedPf extends Feed
         }
 
         $params = [
-            'select' => ['ID', 'TITLE', 'UF_CRM_9_1753773914', static::UF_PF_LOCATION_ACTIVE],
+            'select' => ['ID', 'TITLE', static::UF_PF_LOCATION_ID, static::UF_PF_LOCATION_ACTIVE],
             'order'  => ['ID' => 'ASC'],
         ];
 
@@ -776,7 +821,7 @@ class FeedPf extends Feed
 
         do {
             $params = [
-                'select' => ['ID', 'TITLE', 'UF_CRM_9_1753773914'],
+                'select' => ['ID', 'TITLE', static::UF_PF_LOCATION_ID],
                 'filter' => [],
                 'order'  => ['ID' => 'ASC'],
                 'limit'  => $limit,
@@ -789,7 +834,7 @@ class FeedPf extends Feed
 
             foreach ($items as $item) {
                 $data = $item->getData();
-                $pfId = $data['UF_CRM_9_1753773914'] ?: 'NO_PFID';
+                $pfId = $data[static::UF_PF_LOCATION_ID] ?: 'NO_PFID';
                 $pfGroups[$pfId][] = $data;
             }
 
@@ -986,7 +1031,7 @@ class FeedPf extends Feed
         if ($data['location']) {
             $loc = $data['location'];
             unset($data['location']);
-            $data['location']['id'] = $loc;
+            $data['location']['id'] = is_array($loc) ? (int)($loc['id'] ?? 0) : (int)$loc;
         } else {
             $reserr[] = 'location';
         }

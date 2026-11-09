@@ -12,6 +12,9 @@ use Bitrix\Main\Application;
 
 class FeedBayut extends Feed
 {
+    public const UF_BAYUT_LOCATION_ID = 'UF_CRM_13_1762325631';
+    public const UF_BAYUT_LOCATION_COORDINATES = 'UF_CRM_13_1794228636';
+
     protected static $root;
     protected static $mask;
     protected static $furnmap;
@@ -589,7 +592,7 @@ class FeedBayut extends Feed
                 } else {
                     $items = $bayutLocFactory->getItems([
                         'select' => ['ID'],
-                        'filter' => ['=UF_CRM_13_1762325631' => $locationId],
+                        'filter' => ['=' . static::UF_BAYUT_LOCATION_ID => $locationId],
                         'limit' => 1
                     ]);
                     $item = $items ? reset($items) : null;
@@ -1022,10 +1025,20 @@ class FeedBayut extends Feed
             $property->Property_purpose = $item['Property_purpose'];
             $property->Property_Type = $item['Property_Type'];
             $property->Property_Status = $item['Property_Status'];
-            $property->City = $item['location']['City'];
-            $property->Locality = $item['location']['Locality'];
-            $property->Sub_Locality = $item['location']['Sub_Locality'];
-            $property->Tower_Name = $item['location']['Tower_Name'];
+            $property->City = $item['location']['City'] ?? '';
+            $property->Locality = $item['location']['Locality'] ?? '';
+            $property->Sub_Locality = $item['location']['Sub_Locality'] ?? '';
+            $property->Tower_Name = $item['location']['Tower_Name'] ?? '';
+            if (!empty($item['location']['Latitude'])) {
+                $property->Latitude = $item['location']['Latitude'];
+            } elseif (!empty($item['Latitude'])) {
+                $property->Latitude = $item['Latitude'];
+            }
+            if (!empty($item['location']['Longitude'])) {
+                $property->Longitude = $item['location']['Longitude'];
+            } elseif (!empty($item['Longitude'])) {
+                $property->Longitude = $item['Longitude'];
+            }
             $property->Property_Title = $item['Property_Title'];
             $property->Property_Title_AR = $item['Property_Title_AR'];
             $property->Property_Description = $item['Property_Description'];
@@ -1655,5 +1668,320 @@ class FeedBayut extends Feed
         }
 
         return is_string($response) ? $response : json_encode($response);
+    }
+
+    public static function getHttpClient()
+    {
+        $httpClient = new HttpClient([
+            "socketTimeout" => 10,
+            "streamTimeout" => 15
+        ]);
+
+        $httpClient->setHeader('Content-Type', 'application/json', true);
+        $httpClient->setHeader('Accept', 'application/json', true);
+
+        $apiKey = Option::get('webmatrik.integrations', 'main_BayutDubizzle_SECONDARY_API_KEY', '')
+            ?: Option::get('webmatrik.integrations', 'main_BayutDubizzle_OFFPLAN_API_KEY', '');
+        if (!empty($apiKey)) {
+            $httpClient->setHeader('Authorization', 'Bearer ' . $apiKey, true);
+        }
+
+        return $httpClient;
+    }
+
+    public static function getBayutLocations($city = null, &$hasError = false)
+    {
+        $logFile = 'bayut_location_sync.log';
+        $httpClient = self::getHttpClient();
+        $url = 'https://api.bayut.com/v1/locations';
+
+        $queryParams = [
+            'page' => 1,
+            'perPage' => 100
+        ];
+        if (!empty($city)) {
+            $queryParams['search'] = $city;
+        }
+
+        $fullUrl = $url . '?' . http_build_query($queryParams);
+        $response = $httpClient->get($fullUrl);
+        $status = $httpClient->getStatus();
+
+        $bayutlocations = [];
+        $hasError = false;
+
+        if ($status == 200) {
+            $responseData = json_decode($response, true);
+            if (!is_array($responseData) || !isset($responseData['data'])) {
+                $hasError = true;
+                \Bitrix\Main\Diag\Debug::writeToFile("❌ Failed to decode Bayut response or missing data for " . ($city ?: 'all') . " page 1", '', $logFile);
+                return $bayutlocations;
+            }
+
+            $pages = (int)($responseData['pagination']['totalPages'] ?? $responseData['pagination']['total_pages'] ?? 1);
+            foreach ($responseData['data'] as $item) {
+                if (!empty($item['id'])) {
+                    $bayutlocations[$item['id']] = [
+                        'breadcrumb'  => $item['breadcrumb']['en'] ?? [],
+                        'coordinates' => $item['coordinates'] ?? null,
+                    ];
+                }
+            }
+
+            if ($pages > 1) {
+                $startpage = 2;
+                while ($startpage <= $pages) {
+                    $queryParams['page'] = $startpage;
+                    $startpage++;
+                    $fullUrl = $url . '?' . http_build_query($queryParams);
+
+                    $response = $httpClient->get($fullUrl);
+                    $status = $httpClient->getStatus();
+
+                    if ($status == 200) {
+                        $responseData = json_decode($response, true);
+                        if (is_array($responseData) && isset($responseData['data'])) {
+                            foreach ($responseData['data'] as $item) {
+                                if (!empty($item['id'])) {
+                                    $bayutlocations[$item['id']] = [
+                                        'breadcrumb'  => $item['breadcrumb']['en'] ?? [],
+                                        'coordinates' => $item['coordinates'] ?? null,
+                                    ];
+                                }
+                            }
+                        } else {
+                            $hasError = true;
+                            \Bitrix\Main\Diag\Debug::writeToFile("❌ JSON parse error for " . ($city ?: 'all') . " on page " . ($startpage - 1), '', $logFile);
+                            break;
+                        }
+                    } else {
+                        $hasError = true;
+                        \Bitrix\Main\Diag\Debug::writeToFile("❌ HTTP Error: {$status} on page " . ($startpage - 1) . " for " . ($city ?: 'all'), '', $logFile);
+                        break;
+                    }
+                }
+            }
+        } else {
+            $hasError = true;
+            \Bitrix\Main\Diag\Debug::writeToFile("❌ HTTP Error: {$status} on page 1 for " . ($city ?: 'all') . ". Response: {$response}", '', $logFile);
+        }
+
+        return $bayutlocations;
+    }
+
+    public function syncLocations($cities = null)
+    {
+        $logFile = 'bayut_location_sync.log';
+        $timestamp = date('Y-m-d H:i:s');
+
+        $defaultCities = ['Dubai', 'Abu Dhabi', 'Sharjah', 'Ajman', 'Ras Al Khaimah', 'Fujairah', 'Umm Al Quwain'];
+        if ($cities === null) {
+            $cities = $defaultCities;
+        } elseif (is_string($cities)) {
+            $cities = [$cities];
+        } elseif (!is_array($cities)) {
+            $cities = $defaultCities;
+        }
+
+        \Bitrix\Main\Diag\Debug::writeToFile("--- Bayut Location Sync started for cities: " . implode(', ', $cities) . " --- {$timestamp}", '', $logFile);
+
+        $factory = \Bitrix\Crm\Service\Container::getInstance()->getFactory(static::$bayutLocentityTypeId);
+        if (!$factory) {
+            throw new \Exception('Factory not found for entity type ID: ' . static::$bayutLocentityTypeId);
+        }
+
+        // Cache all current locations
+        static $allCurLocations = null;
+        if ($allCurLocations === null) {
+            $params = [
+                'select' => ['ID', 'TITLE', static::UF_BAYUT_LOCATION_ID, static::UF_BAYUT_LOCATION_COORDINATES],
+                'order'  => ['ID' => 'ASC'],
+            ];
+
+            $items = $factory->getItems($params);
+
+            $allCurLocations = [
+                'byBayut' => [],
+                'byTitle' => [],
+                'allItems' => []
+            ];
+
+            foreach ($items as $item) {
+                $data = $item->getData();
+                $titleNorm = mb_strtolower(trim(preg_replace('/\s+/', ' ', $data['TITLE'])));
+                $bayutId = $data[static::UF_BAYUT_LOCATION_ID] ?? null;
+                $geo = $data[static::UF_BAYUT_LOCATION_COORDINATES] ?? '';
+
+                $locInfo = [
+                    'ID' => (int)$data['ID'],
+                    'TITLE' => $data['TITLE'],
+                    'BAYUT_ID' => $bayutId,
+                    'GEO' => $geo,
+                ];
+
+                if (!empty($bayutId)) {
+                    $allCurLocations['byBayut'][$bayutId] = $locInfo;
+                }
+                $allCurLocations['allItems'][$data['ID']] = $locInfo;
+                $allCurLocations['byTitle'][$titleNorm] = $locInfo;
+            }
+
+            \Bitrix\Main\Diag\Debug::writeToFile('Cached existing Bayut locations: ' . count($allCurLocations['byTitle']), '', $logFile);
+        }
+
+        foreach ($cities as $city) {
+            $cityTimestamp = date('Y-m-d H:i:s');
+            \Bitrix\Main\Diag\Debug::writeToFile("--- Syncing Bayut city: {$city} --- {$cityTimestamp}", '', $logFile);
+
+            $cityHasError = false;
+            $bayutLocations = static::getBayutLocations($city, $cityHasError);
+
+            if (empty($bayutLocations)) {
+                \Bitrix\Main\Diag\Debug::writeToFile("No Bayut locations found for {$city}", '', $logFile);
+                continue;
+            }
+
+            foreach ($bayutLocations as $bayutId => $locData) {
+                $breadcrumb = $locData['breadcrumb'] ?? [];
+                $coordinates = $locData['coordinates'] ?? null;
+
+                $geoPoint = '';
+                if (!empty($coordinates)) {
+                    $lat = $coordinates['latitude'] ?? $coordinates['lat'] ?? null;
+                    $lng = $coordinates['longitude'] ?? $coordinates['lng'] ?? null;
+                    if ($lat !== null && $lng !== null && $lat !== '' && $lng !== '') {
+                        $geoPoint = $lat . ',' . $lng;
+                    }
+                }
+
+                // 1. Match by Bayut ID
+                if (isset($allCurLocations['byBayut'][$bayutId])) {
+                    $cachedLoc = $allCurLocations['byBayut'][$bayutId];
+                    if ($geoPoint && ($cachedLoc['GEO'] ?? '') !== $geoPoint) {
+                        $existingItem = $factory->getItem($cachedLoc['ID']);
+                        if ($existingItem) {
+                            $existingItem->set(static::UF_BAYUT_LOCATION_COORDINATES, $geoPoint);
+                            $updateOp = $factory->getUpdateOperation($existingItem)
+                                ->disableCheckFields()
+                                ->disableBizProc()
+                                ->disableCheckAccess();
+                            $updateRes = $updateOp->launch();
+
+                            if ($updateRes->isSuccess()) {
+                                \Bitrix\Main\Diag\Debug::writeToFile("Updated coordinates for Bayut location '{$cachedLoc['TITLE']}' (ID: {$cachedLoc['ID']}, Bayut ID: {$bayutId}) to {$geoPoint}", '', $logFile);
+                                $allCurLocations['byBayut'][$bayutId]['GEO'] = $geoPoint;
+                                if (isset($allCurLocations['allItems'][$cachedLoc['ID']])) {
+                                    $allCurLocations['allItems'][$cachedLoc['ID']]['GEO'] = $geoPoint;
+                                }
+                            } else {
+                                $errors = implode('; ', $updateRes->getErrorMessages());
+                                \Bitrix\Main\Diag\Debug::writeToFile("Failed to update coordinates for Bayut location '{$cachedLoc['TITLE']}': {$errors}", '', $logFile);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Build title from breadcrumb
+                $parts = [];
+                foreach ($breadcrumb as $part) {
+                    if (is_string($part)) {
+                        $p = trim($part);
+                    } elseif (is_array($part)) {
+                        $p = trim($part['name'] ?? $part['title'] ?? $part['en'] ?? '');
+                    } else {
+                        $p = '';
+                    }
+                    if ($p !== '' && mb_strtolower($p) !== 'unknown') {
+                        $parts[] = $p;
+                    }
+                }
+
+                if (!empty($parts)) {
+                    if (in_array(mb_strtolower($parts[0]), ['uae', 'united arab emirates'])) {
+                        array_shift($parts);
+                    }
+                    $reversed = array_reverse($parts);
+                    $title = implode(', ', $reversed);
+                } else {
+                    continue;
+                }
+
+                $titleNorm = mb_strtolower(trim(preg_replace('/\s+/', ' ', $title)));
+
+                // 2. Match by Title
+                if (isset($allCurLocations['byTitle'][$titleNorm])) {
+                    $cachedLoc = $allCurLocations['byTitle'][$titleNorm];
+                    $existingId = $cachedLoc['ID'];
+                    $existingItem = $factory->getItem($existingId);
+
+                    if ($existingItem) {
+                        $existingItem->set(static::UF_BAYUT_LOCATION_ID, $bayutId);
+                        if ($geoPoint) {
+                            $existingItem->set(static::UF_BAYUT_LOCATION_COORDINATES, $geoPoint);
+                        }
+                        $updateOp = $factory->getUpdateOperation($existingItem)
+                            ->disableCheckFields()
+                            ->disableBizProc()
+                            ->disableCheckAccess();
+                        $updateRes = $updateOp->launch();
+
+                        if ($updateRes->isSuccess()) {
+                            \Bitrix\Main\Diag\Debug::writeToFile("Updated existing Bayut location '{$title}' (ID: {$existingId}) with Bayut ID: {$bayutId}" . ($geoPoint ? " and coordinates: {$geoPoint}" : ""), '', $logFile);
+                            $locInfo = [
+                                'ID' => $existingId,
+                                'TITLE' => $title,
+                                'BAYUT_ID' => $bayutId,
+                                'GEO' => $geoPoint ?: ($cachedLoc['GEO'] ?? ''),
+                            ];
+                            $allCurLocations['byBayut'][$bayutId] = $locInfo;
+                            $allCurLocations['allItems'][$existingId] = $locInfo;
+                            $allCurLocations['byTitle'][$titleNorm] = $locInfo;
+                        } else {
+                            $errors = implode('; ', $updateRes->getErrorMessages());
+                            \Bitrix\Main\Diag\Debug::writeToFile("Failed to update Bayut location '{$title}': {$errors}", '', $logFile);
+                        }
+                    }
+                    continue;
+                }
+
+                // 3. Create New Location
+                $fields = [
+                    'TITLE' => $title,
+                    'ASSIGNED_BY_ID' => 1013,
+                    static::UF_BAYUT_LOCATION_ID => $bayutId,
+                    static::UF_BAYUT_LOCATION_COORDINATES => $geoPoint ?: '',
+                ];
+                $newItem = $factory->createItem($fields);
+                $operation = $factory->getAddOperation($newItem)
+                    ->disableCheckFields()
+                    ->disableBizProc()
+                    ->disableCheckAccess();
+                $addResult = $operation->launch();
+
+                if ($addResult->isSuccess()) {
+                    $newId = $newItem->getId();
+                    \Bitrix\Main\Diag\Debug::writeToFile("Added new Bayut location '{$title}' (ID: {$newId}, Bayut ID: {$bayutId}, GEO: {$geoPoint})", '', $logFile);
+
+                    $locInfo = [
+                        'ID' => $newId,
+                        'TITLE' => $title,
+                        'BAYUT_ID' => $bayutId,
+                        'GEO' => $geoPoint ?: '',
+                    ];
+                    $allCurLocations['byBayut'][$bayutId] = $locInfo;
+                    $allCurLocations['allItems'][$newId] = $locInfo;
+                    $allCurLocations['byTitle'][$titleNorm] = $locInfo;
+                } else {
+                    $errors = implode('; ', $addResult->getErrorMessages());
+                    \Bitrix\Main\Diag\Debug::writeToFile("Failed to add Bayut location '{$title}': {$errors}", '', $logFile);
+                }
+            }
+
+            \Bitrix\Main\Diag\Debug::writeToFile("--- Bayut city completed: {$city} ---", '', $logFile);
+        }
+
+        $endTimestamp = date('Y-m-d H:i:s');
+        \Bitrix\Main\Diag\Debug::writeToFile("--- Bayut Location Sync finished --- {$endTimestamp}", '', $logFile);
     }
 }
